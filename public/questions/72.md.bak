@@ -1,0 +1,210 @@
+# 母题 Q72：Data Warehouse（数据仓库，新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 数仓核心是“统一口径”，不是“多建几张表”。  
+2. 难点在于业务口径常变、数据来源复杂、历史回溯要求高。  
+3. 面试高分关键：讲清分层建模、事实维度、指标治理、权限与质量。  
+
+---
+
+## 1. 故事开场
+- 产品问：昨日 GMV 是多少？运营和财务报出来不一样。  
+- 原因：两边口径不同（是否包含退款、取消订单等）。  
+- 数仓要解决：同一个指标在全公司“同口径同结果”。  
+
+---
+
+## 2. 白话术语
+| 术语 | 白话 |
+|---|---|
+| ODS | 原始数据层 |
+| DWD | 明细标准层 |
+| DWS | 汇总主题层 |
+| ADS | 应用指标层 |
+| Dimension | 维度（如用户、商品） |
+| Fact | 事实（如订单交易） |
+| SCD | 维度慢变处理 |
+| Metric Definition | 指标定义（口径） |
+
+---
+
+## 3. 需求澄清
+- 汇总多源数据（订单、支付、用户、活动）。  
+- 输出稳定指标和分析报表。  
+- 支持离线批处理 + 近实时更新。  
+
+---
+
+## 4. 容量估算
+- 日订单明细 20 亿条。  
+- 明细表按天分区，保留 2~3 年。  
+- 查询高峰上千并发，需列式存储与预聚合。  
+
+---
+
+## 5. 架构
+```text
+Sources -> ODS -> DWD -> DWS -> ADS -> BI Dashboard
+                 |                |
+            Data Quality      Metric Governance
+```
+
+---
+
+## 6. 数据建模
+### 6.1 维度表示例
+```sql
+CREATE TABLE dim_user (
+  user_id BIGINT,
+  city STRING,
+  level STRING,
+  valid_from DATE,
+  valid_to DATE
+);
+```
+
+### 6.2 事实表示例
+```sql
+CREATE TABLE fct_order (
+  order_id BIGINT,
+  user_id BIGINT,
+  item_id BIGINT,
+  pay_amount BIGINT,
+  order_status STRING,
+  pay_time TIMESTAMP
+) PARTITIONED BY (dt STRING);
+```
+
+---
+
+## 7. 核心流程
+1. ODS 接原始数据。  
+2. DWD 清洗去重，统一字段。  
+3. DWS 按主题汇总。  
+4. ADS 输出业务指标。  
+5. BI 消费指标展示。  
+
+---
+
+## 8. 指标口径治理（关键）
+- 每个指标有唯一定义 ID。  
+- 指标计算逻辑版本化。  
+- 口径变更需评审与公告。  
+
+---
+
+## 9. 一致性与可追溯
+- 同一时间窗口内指标可重算。  
+- 保留血缘：指标 -> 表 -> 字段 -> 任务。  
+- 异常可追溯到具体任务批次。  
+
+---
+
+## 10. 可用性与容错
+- 任务失败自动重试。  
+- 关键链路双活调度器。  
+- 延迟超阈值触发降级（先展示昨日快照）。  
+
+---
+
+## 11. 可观测性
+- `etl_success_rate`  
+- `pipeline_delay`  
+- `metric_diff_rate`  
+- `quality_fail_count`  
+- `bi_query_p95`  
+
+---
+
+## 12. 安全与权限
+- 行列级权限控制（部门/角色）。  
+- 敏感字段脱敏。  
+- 报表权限隔离。  
+
+---
+
+## 13. 成本取舍
+- 全量实时成本高，核心指标实时、其他离线。  
+- 长历史明细进冷存。  
+- 频繁大查询用预计算聚合表。  
+
+---
+
+## 14. Java 关键代码（4 段）
+```java
+public class MetricRegistry {
+  public MetricDefinition register(String code, String sql, String owner) {
+    return repo.save(new MetricDefinition(code, sql, owner, 1));
+  }
+}
+```
+
+```java
+public class DataQualityService {
+  public QualityResult checkCount(long expected, long actual) {
+    long diff = Math.abs(expected - actual);
+    boolean pass = diff <= expected * 0.01; // 1% 偏差阈值
+    return new QualityResult(pass, diff);
+  }
+}
+```
+
+```java
+public class LineageService {
+  public void record(String metric, List<String> tables) {
+    tables.forEach(t -> repo.save(metric, t));
+  }
+}
+```
+
+```java
+public class BackfillJob {
+  public void rerun(LocalDate from, LocalDate to) {
+    LocalDate d = from;
+    while (!d.isAfter(to)) {
+      scheduler.submit("dwd_order_job", d.toString());
+      d = d.plusDays(1);
+    }
+  }
+}
+```
+
+---
+
+## 15. 测试策略
+- 单测：指标 SQL 与口径规则。  
+- 回归：历史天数据重算对比。  
+- 故障演练：调度器宕机、上游缺数。  
+
+---
+
+## 16. 10 个例子
+1. GMV 是否含退款口径冲突。  
+2. 用户城市维度慢变。  
+3. 订单重复事件去重。  
+4. 分区缺失导致报表断层。  
+5. 节假日流量异常波动。  
+6. 任务延迟导致看板数据滞后。  
+7. 指标重算修复历史错误。  
+8. 新业务线接入数仓。  
+9. 敏感字段脱敏展示。  
+10. 大促期间预聚合保性能。  
+
+---
+
+## 17. 面试追问
+- 星型和雪花模型怎么选？  
+- 口径变化如何管理？  
+- 如何处理迟到数据？  
+
+---
+
+## 18. 新手路线 + Checklist
+- 先做 ODS->DWD->ADS 小链路。  
+- Checklist：分层建模、口径治理、质量监控都能讲。  
+
+---
+
+## 19. 30 秒总结
+- 数仓本质是“统一口径 + 稳定供数 + 可追溯治理”。  
+- 面试讲清分层、指标、质量、权限和成本就是完整答案。  

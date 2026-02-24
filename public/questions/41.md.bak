@@ -1,0 +1,218 @@
+# 母题 Q41：Data Pipeline（数据管道，新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 数据管道就是“把数据从业务系统稳定搬到分析系统”。  
+2. 难点是数据不丢、不乱、不重复，同时延迟可控。  
+3. 面试高分关键：讲清采集、处理、落地、质量校验、血缘和重放。  
+
+---
+
+## 1. 故事开场
+- 电商要看实时 GMV、下单漏斗、异常告警。  
+- 数据来源多：订单库、支付库、日志埋点。  
+- 一条链路出错就会“报表错、决策错”。  
+
+---
+
+## 2. 名词白话
+| 术语 | 白话 |
+|---|---|
+| Ingestion | 采集 |
+| Stream Processing | 流式处理 |
+| Batch Processing | 批处理 |
+| ETL | 抽取-转换-加载 |
+| CDC | 数据库变更捕获 |
+| Exactly-once | 尽量做到不重不漏 |
+| Lineage | 血缘（这张表从哪来） |
+| Data Quality | 数据质量（完整性、准确性） |
+
+---
+
+## 3. 需求澄清
+- 采集多源数据。  
+- 支持实时和离线处理。  
+- 支持落地到数仓/湖仓。  
+- 支持指标与报表查询。  
+
+非功能：  
+- 延迟目标（实时分钟级）。  
+- 数据正确性可追溯。  
+
+---
+
+## 4. 容量估算
+- 假设每秒 200 万条事件。  
+- 平均事件 1KB，吞吐约 2GB/s。  
+- 必须分区并行 + 流处理框架。  
+
+---
+
+## 5. 架构
+```text
+Sources(DB/Logs/Apps)
+ -> Ingestion (CDC/SDK/Agent)
+ -> Message Bus (Kafka)
+ -> Stream Compute (Flink/Spark)
+ -> Storage (Data Lake/Warehouse)
+ -> Serving (OLAP/BI)
+ -> Monitoring + Data Quality + Lineage
+```
+
+---
+
+## 6. API / 接口思路
+- `POST /v1/events/collect`（埋点）  
+- `POST /v1/pipelines/{id}/run`  
+- `GET /v1/pipelines/{id}/status`  
+- `POST /v1/quality/check`  
+
+---
+
+## 7. 数据模型
+```sql
+CREATE TABLE raw_event (
+  event_id VARCHAR(64) PRIMARY KEY,
+  source VARCHAR(32) NOT NULL,
+  event_type VARCHAR(32) NOT NULL,
+  payload JSON NOT NULL,
+  event_time TIMESTAMP NOT NULL,
+  ingest_time TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE quality_result (
+  check_id BIGINT PRIMARY KEY,
+  dataset VARCHAR(128) NOT NULL,
+  rule_name VARCHAR(128) NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  bad_count BIGINT,
+  ts TIMESTAMP NOT NULL
+);
+```
+
+---
+
+## 8. 核心流程
+1. 数据采集入 Kafka。  
+2. Flink 清洗、去重、聚合。  
+3. 写入明细层和汇总层。  
+4. 质量校验失败触发告警。  
+5. BI 查询和看板展示。  
+
+---
+
+## 9. Exactly-once 取舍
+- 理想是 Exactly-once，但实现成本高。  
+- 常见工程方案：至少一次 + 幂等写入。  
+- 核心指标场景才强推 Exactly-once。  
+
+---
+
+## 10. 可用性容错
+- 上游抖动：缓冲队列削峰。  
+- 流任务失败：checkpoint + 自动恢复。  
+- 下游不可写：重试 + dead letter queue。  
+
+---
+
+## 11. 可观测性
+- `event_lag`  
+- `consumer_lag`  
+- `job_fail_rate`  
+- `quality_fail_rate`  
+- `pipeline_latency_p95`  
+
+---
+
+## 12. 安全与治理
+- 敏感字段脱敏。  
+- 数据访问权限分级。  
+- 血缘追踪支持审计与追责。  
+
+---
+
+## 13. 成本取舍
+- 全实时成本高，可实时+离线混合。  
+- 冷数据转低成本存储。  
+- 历史重算按需触发。  
+
+---
+
+## 14. Java 关键代码（4 段）
+```java
+public class EventDeduplicator {
+  private final Set<String> seen = ConcurrentHashMap.newKeySet();
+  public boolean accept(String eventId) {
+    return seen.add(eventId); // true 表示新事件
+  }
+}
+```
+
+```java
+public class WindowAggregator {
+  public Map<String, Long> aggregate(List<Event> events) {
+    return events.stream().collect(Collectors.groupingBy(Event::type, Collectors.counting()));
+  }
+}
+```
+
+```java
+public class QualityChecker {
+  public QualityResult checkNotNull(List<Map<String, Object>> rows, String field) {
+    long bad = rows.stream().filter(r -> r.get(field) == null).count();
+    return new QualityResult(field, bad == 0, bad);
+  }
+}
+```
+
+```java
+public class ReplayService {
+  public void replay(String topic, long fromOffset, long toOffset) {
+    for (long off = fromOffset; off <= toOffset; off++) {
+      Event e = kafka.read(topic, off);
+      process(e);
+    }
+  }
+}
+```
+
+---
+
+## 15. 测试策略
+- 单测：清洗规则、聚合准确性。  
+- 压测：高吞吐、背压场景。  
+- 故障注入：broker 宕机、任务重启。  
+
+---
+
+## 16. 10 个例子
+1. 订单事件晚到处理。  
+2. 支付重复事件去重。  
+3. Kafka 分区倾斜修复。  
+4. Flink 作业 checkpoint 恢复。  
+5. 数据质量发现空值激增。  
+6. 血缘定位错误报表来源。  
+7. 批流口径不一致修正。  
+8. 重放历史数据修复指标。  
+9. PII 字段脱敏上线。  
+10. 冷热分层降低 30% 存储成本。  
+
+---
+
+## 17. 面试追问
+- 如何保证不丢数据？  
+- Exactly-once 值不值得做？  
+- 如何处理延迟到达事件？  
+
+---
+
+## 18. 新手路线 + Checklist
+- 先做 Kafka + Flink 小链路，再补质量与血缘。  
+- Checklist：采集、处理、落地、质量、重放都能讲。  
+
+---
+
+## 19. 30 秒总结
+- Data Pipeline 的核心是“稳定搬运 + 正确加工 + 可追溯治理”。  
+- 面试里把正确性、延迟、质量、重放讲清，就是成熟方案。  

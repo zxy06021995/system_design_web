@@ -1,0 +1,254 @@
+# 母题 Q36：推荐系统（Amazon Recommendation，新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 推荐系统不是“猜用户喜欢什么”这么简单，而是“多阶段筛选 + 排序 + 反馈学习”。  
+2. 难点是同时满足：效果（点击/转化）、实时性、可解释性和成本。  
+3. 面试高分关键：讲清召回-粗排-精排、特征工程、在线评估、冷启动。  
+
+---
+
+## 1. 故事开场
+- 用户刚看完一双跑鞋，下一屏系统推荐什么？  
+- 如果只推荐最热门商品，相关性差。  
+- 如果只推荐极个性，可能覆盖不够。  
+- 所以要先大范围召回，再逐层排序。  
+
+---
+
+## 2. 白话术语
+| 术语 | 白话解释 |
+|---|---|
+| Recall 召回 | 先从海量商品里找一批候选 |
+| Coarse Rank 粗排 | 快速过滤不太可能点击的候选 |
+| Fine Rank 精排 | 用复杂模型精确算分排前后 |
+| Feature 特征 | 用户、商品、上下文信息 |
+| CTR/CVR | 点击率/转化率 |
+| Cold Start | 新用户或新商品没有历史数据 |
+| Exploration | 适当探索新内容 |
+| Exploitation | 利用已知高效果内容 |
+
+---
+
+## 3. 需求澄清
+- 给用户推荐 TopN 商品。  
+- 请求延迟 P95 < 150ms。  
+- 支持实时行为反馈（点击、加购、购买）。  
+- 支持 AB 实验。  
+
+不做：  
+- 不做全量在线训练。  
+- 不做所有页面统一模型（首版分场景）。  
+
+---
+
+## 4. 容量估算
+- DAU 1 亿，推荐请求 20 亿/天。  
+- 平均 QPS ~ 23k，峰值 6x -> 140k+。  
+- 候选池千万级，必须分阶段缩小。  
+
+---
+
+## 5. 架构
+```text
+User Request
+ -> Feature Service
+ -> Recall Service (multi-channel)
+ -> Coarse Rank
+ -> Fine Rank
+ -> Re-rank (diversity/business rules)
+ -> Return TopN
+
+Feedback -> Kafka -> Feature Update -> Model Training/Validation
+```
+
+---
+
+## 6. 召回通道（面试常问）
+- 协同过滤召回（相似用户/商品）。  
+- 内容召回（类目、标签、文本向量）。  
+- 热门召回（趋势商品）。  
+- 规则召回（活动、运营位）。  
+
+多路召回后合并去重。  
+
+---
+
+## 7. API 设计
+- `POST /v1/reco/recommend`  
+- `POST /v1/reco/feedback`  
+- `GET /v1/reco/ab/config`  
+
+---
+
+## 8. 数据模型
+```sql
+CREATE TABLE user_profile (
+  user_id BIGINT PRIMARY KEY,
+  age INT,
+  gender VARCHAR(8),
+  city VARCHAR(64),
+  interests JSON,
+  updated_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE item_profile (
+  item_id BIGINT PRIMARY KEY,
+  category VARCHAR(64),
+  brand VARCHAR(64),
+  price BIGINT,
+  tags JSON,
+  updated_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE user_event (
+  event_id BIGINT PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  item_id BIGINT NOT NULL,
+  event_type VARCHAR(16) NOT NULL, -- click/cart/buy
+  ts TIMESTAMP NOT NULL
+);
+```
+
+---
+
+## 9. 核心流程
+1. 请求进来读取用户上下文。  
+2. 多路召回拿到 1k~5k 候选。  
+3. 粗排降到 200。  
+4. 精排得到 TopN。  
+5. 重排做多样性与业务约束。  
+
+---
+
+## 10. 一致性与边界
+- 推荐结果允许最终一致（特征有分钟级延迟可接受）。  
+- 反馈事件至少一次入队，训练侧做幂等去重。  
+
+---
+
+## 11. 可用性与容错
+- 模型服务超时：降级到规则/热门推荐。  
+- 特征服务不可用：降级用离线特征快照。  
+- 某召回通道故障：其他通道兜底。  
+
+---
+
+## 12. 可观测性
+- `recommend_p95`  
+- `recall_count`  
+- `ctr/cvr`  
+- `model_timeout_rate`  
+- `ab_uplift`  
+
+---
+
+## 13. 安全与合规
+- 用户特征脱敏和最小化采集。  
+- 敏感特征不直接用于个性化。  
+- 审计实验配置变更。  
+
+---
+
+## 14. 成本取舍
+- 模型越复杂效果可能更好，但延迟和算力成本更高。  
+- 多路召回覆盖更好，但需要去重和融合成本。  
+
+---
+
+## 15. Java 关键代码（4 段）
+```java
+public class RecallMerger {
+  public List<Long> merge(List<List<Long>> channels, int limit) {
+    LinkedHashSet<Long> set = new LinkedHashSet<>();
+    for (List<Long> c : channels) {
+      for (Long id : c) {
+        set.add(id);
+        if (set.size() >= limit) break;
+      }
+      if (set.size() >= limit) break;
+    }
+    return new ArrayList<>(set);
+  }
+}
+```
+
+```java
+public class CoarseRankService {
+  public List<Candidate> topK(List<Candidate> cands, int k) {
+    return cands.stream()
+      .sorted(Comparator.comparingDouble(Candidate::coarseScore).reversed())
+      .limit(k)
+      .toList();
+  }
+}
+```
+
+```java
+public class ReRankService {
+  public List<Candidate> diversify(List<Candidate> ranked, int topN) {
+    Map<String, Integer> catCnt = new HashMap<>();
+    List<Candidate> out = new ArrayList<>();
+    for (Candidate c : ranked) {
+      int cnt = catCnt.getOrDefault(c.category(), 0);
+      if (cnt >= 3) continue; // 防止同类过多
+      out.add(c);
+      catCnt.put(c.category(), cnt + 1);
+      if (out.size() >= topN) break;
+    }
+    return out;
+  }
+}
+```
+
+```java
+public class FallbackService {
+  public List<Long> fallback(long userId, int n) {
+    List<Long> hot = hotService.topHotItems(n);
+    return coldStartService.mixByCategory(userId, hot, n);
+  }
+}
+```
+
+---
+
+## 16. 测试策略
+- 单测：召回融合、排序稳定性、重排规则。  
+- 压测：高并发推荐延迟。  
+- 实验：AB 看 CTR/CVR uplift。  
+
+---
+
+## 17. 10 个例子
+1. 新用户无历史，用热门+类目冷启动。  
+2. 新商品无点击，用内容特征召回。  
+3. 某模型超时降级到热门。  
+4. 同类商品过多用重排打散。  
+5. 节日活动插入运营位。  
+6. 用户刚购买，短期降低重复推荐。  
+7. 点击高但转化低，精排调整权重。  
+8. 高价商品曝光不足，业务规则加权。  
+9. 夜间流量低可做探索。  
+10. A/B 实验显示新模型提升 3% CTR。  
+
+---
+
+## 18. 面试追问
+- 为什么分三阶段排序？  
+- 冷启动怎么做？  
+- 如何避免“信息茧房”？  
+
+---
+
+## 19. 新手路线 + Checklist
+- 先做规则推荐，再做召回，再做简单排序。  
+- Checklist：能讲三阶段、反馈闭环、降级兜底。  
+
+---
+
+## 20. 30 秒总结
+- 推荐系统核心是“多路召回 + 分层排序 + 反馈学习”。  
+- 面试能讲清冷启动、AB、容错和成本，基本就是高分答案。  

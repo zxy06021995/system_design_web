@@ -1,0 +1,213 @@
+# 母题 Q90：Peer-to-Peer Network（新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. P2P 网络核心是“节点之间直接协作”，不依赖单中心。  
+2. 难点是：节点上下线频繁、路由效率、数据副本一致性。  
+3. 面试高分关键：讲清节点发现、DHT 路由、副本修复、NAT 穿透。  
+
+---
+
+## 1. 故事开场
+- 你要下载一个文件，数据来自很多用户节点。  
+- 有的节点突然下线，有的网络慢，有的在 NAT 后面。  
+- 系统要保证“还能找到数据并继续下载”。  
+
+---
+
+## 2. 术语白话
+| 术语 | 白话 |
+|---|---|
+| Peer | 网络中的一个节点 |
+| DHT | 分布式哈希表（谁存了哪段数据） |
+| Kademlia | 常见 DHT 路由算法 |
+| Gossip | 节点间八卦式传播状态 |
+| Replication | 多副本存储 |
+| NAT Traversal | NAT 穿透 |
+
+---
+
+## 3. 需求澄清
+- 节点加入/离开网络。  
+- 支持 key 查找和数据下载。  
+- 支持副本与容错。  
+
+非功能：  
+- 查找延迟低。  
+- 节点波动下系统仍可用。  
+
+---
+
+## 4. 容量估算
+- 节点数 100 万。  
+- 每节点存 5GB。  
+- 查询峰值 50k QPS。  
+
+---
+
+## 5. 架构
+```text
+Bootstrap Nodes
+  -> Peer Join
+  -> Routing Table (K-buckets)
+  -> DHT Lookup
+  -> Data Transfer
+  -> Replication Repair
+```
+
+---
+
+## 6. API/协议
+- `FIND_NODE(targetId)`  
+- `FIND_VALUE(key)`  
+- `STORE(key, valueRef)`  
+- `PING(peerId)`  
+
+---
+
+## 7. 数据模型
+```sql
+CREATE TABLE peer_node (
+  peer_id VARCHAR(64) PRIMARY KEY,
+  ip VARCHAR(64),
+  port INT,
+  status VARCHAR(16),
+  last_seen TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE dht_record (
+  dht_key VARCHAR(128) PRIMARY KEY,
+  value_ref VARCHAR(512) NOT NULL,
+  replica_peers JSON NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+);
+```
+
+---
+
+## 8. 核心流程
+1. 节点通过 bootstrap 加入。  
+2. 构建路由表（按 XOR 距离）。  
+3. 查找 key 时迭代询问更近节点。  
+4. 找到 value 或最近节点集合。  
+5. 副本定期修复。  
+
+---
+
+## 9. 一致性边界
+- P2P 一般最终一致。  
+- 多副本保证可用性。  
+- 写冲突可用版本号或时间戳解决。  
+
+---
+
+## 10. 可用性容错
+- 节点心跳超时剔除。  
+- 下载时多源并行。  
+- 副本不足自动补副本。  
+
+---
+
+## 11. 可观测性
+- `active_peers`  
+- `lookup_hops_avg`  
+- `lookup_success_rate`  
+- `replica_health_ratio`  
+- `nat_traversal_success_rate`  
+
+---
+
+## 12. 安全
+- 节点身份签名防伪造。  
+- 防 Sybil 攻击（准入/信誉机制）。  
+- 数据块校验和防篡改。  
+
+---
+
+## 13. 成本取舍
+- 副本越多可用性越高但存储成本更高。  
+- 路由表越大查找更快但维护成本更高。  
+
+---
+
+## 14. Java 关键代码（4 段）
+```java
+public class XorDistance {
+  public BigInteger distance(String a, String b) {
+    return new BigInteger(a, 16).xor(new BigInteger(b, 16));
+  }
+}
+```
+
+```java
+public class KBucketTable {
+  public void addPeer(Peer p) {
+    int idx = calcBucket(p.id());
+    buckets.get(idx).addOrRefresh(p);
+  }
+}
+```
+
+```java
+public class DhtLookup {
+  public Optional<ValueRef> findValue(String key) {
+    List<Peer> frontier = routing.closestPeers(hash(key), 8);
+    for (Peer p : frontier) {
+      Optional<ValueRef> v = rpc.findValue(p, key);
+      if (v.isPresent()) return v;
+    }
+    return Optional.empty();
+  }
+}
+```
+
+```java
+public class ReplicaRepairJob {
+  public void repair(String key, List<Peer> replicas, int targetReplica) {
+    if (replicas.size() >= targetReplica) return;
+    List<Peer> candidates = routing.closestPeers(hash(key), targetReplica);
+    candidates.forEach(p -> rpc.store(p, key));
+  }
+}
+```
+
+---
+
+## 15. 测试策略
+- 节点 churn 压测（频繁上下线）。  
+- 查找延迟压测。  
+- NAT 穿透成功率测试。  
+
+---
+
+## 16. 10 个例子
+1. 新节点加入路由表更新。  
+2. 节点掉线后自动剔除。  
+3. key 查找失败转最近节点。  
+4. 文件多源下载提升速度。  
+5. 某副本损坏自动修复。  
+6. NAT 后节点打洞失败回 relay。  
+7. 网络分区后重新收敛。  
+8. 恶意节点返回假数据被校验拒绝。  
+9. 路由表老化刷新。  
+10. 热 key 增加副本。  
+
+---
+
+## 17. 面试追问
+- 为什么用 Kademlia？  
+- NAT 穿透失败怎么办？  
+- 副本一致性如何保证？  
+
+---
+
+## 18. 新手路线 + Checklist
+- 先做简单 DHT，再做副本修复和安全。  
+- Checklist：发现、路由、副本、容错、安全都能讲。  
+
+---
+
+## 19. 30 秒总结
+- P2P 网络核心是“去中心路由 + 副本容错 + 节点动态治理”。  
+- 面试能把 DHT、churn、NAT、副本修复讲清，就很有含金量。  

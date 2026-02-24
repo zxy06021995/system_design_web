@@ -1,0 +1,236 @@
+# 母题 Q84：Online Payment System（新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 支付系统核心是“钱不能错”，其次才是快。  
+2. 难点是状态机复杂、回调重试多、对账链路长。  
+3. 面试高分关键：讲清幂等、双记账、清结算、对账补偿。  
+
+---
+
+## 1. 故事开场
+- 用户点击支付后页面超时，但银行卡已扣款。  
+- 业务系统显示失败，资金系统显示成功。  
+- 这就是支付系统最典型的问题：状态不一致。  
+
+---
+
+## 2. 白话术语
+| 术语 | 白话 |
+|---|---|
+| Auth | 预授权 |
+| Capture | 确认扣款 |
+| Ledger | 账本流水 |
+| Clearing | 清分 |
+| Settlement | 结算 |
+| Reconciliation | 对账 |
+| Idempotency | 防重复扣款 |
+| Chargeback | 拒付 |
+
+---
+
+## 3. 需求澄清
+- 支持支付下单、支付执行、回调通知。  
+- 支持退款、撤销。  
+- 支持对账、清结算。  
+
+非功能：  
+- 支付链路高可用。  
+- 数据正确性优先。  
+
+---
+
+## 4. 容量估算
+- 峰值支付请求 50k QPS。  
+- 回调重试会放大流量，需幂等处理。  
+- 账务表写入高频且要求强审计。  
+
+---
+
+## 5. 架构
+```text
+Payment API
+ -> Risk Service
+ -> Channel Router
+ -> Channel Adapter (bank/wallet)
+ -> Payment State Machine
+ -> Ledger Service
+ -> Reconciliation Service
+ -> Clearing/Settlement
+```
+
+---
+
+## 6. API 设计
+- `POST /v1/payments` 创建支付单  
+- `POST /v1/payments/{id}/confirm` 确认  
+- `POST /v1/payments/{id}/refund` 退款  
+- `POST /v1/payments/callback` 渠道回调  
+
+---
+
+## 7. 数据模型
+```sql
+CREATE TABLE payment_order (
+  payment_id BIGINT PRIMARY KEY,
+  merchant_id BIGINT NOT NULL,
+  biz_order_id VARCHAR(128) NOT NULL,
+  amount BIGINT NOT NULL,
+  status VARCHAR(32) NOT NULL, -- CREATED/PENDING/SUCCESS/FAILED/REFUNDED
+  idempotency_key VARCHAR(128) NOT NULL,
+  UNIQUE KEY uk_merchant_idem (merchant_id, idempotency_key)
+);
+```
+
+```sql
+CREATE TABLE ledger_entry (
+  entry_id BIGINT PRIMARY KEY,
+  payment_id BIGINT NOT NULL,
+  account_id BIGINT NOT NULL,
+  direction VARCHAR(8) NOT NULL, -- DEBIT/CREDIT
+  amount BIGINT NOT NULL,
+  ts TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE reconcile_record (
+  rec_id BIGINT PRIMARY KEY,
+  payment_id BIGINT NOT NULL,
+  channel_status VARCHAR(32),
+  local_status VARCHAR(32),
+  result VARCHAR(16),
+  ts TIMESTAMP NOT NULL
+);
+```
+
+---
+
+## 8. 核心流程
+1. 创建支付单。  
+2. 风控校验。  
+3. 路由到支付渠道。  
+4. 收到回调后更新状态。  
+5. 写账本。  
+6. 对账补偿。  
+
+---
+
+## 9. 一致性与事务
+- 本地事务：支付状态更新 + outbox。  
+- 跨系统最终一致：依赖回调 + 对账。  
+- 幂等键防重复扣款。  
+
+---
+
+## 10. 可用性容错
+- 渠道超时：状态置 PENDING，异步查询最终状态。  
+- 回调重复：幂等更新。  
+- 对账发现差异：自动补单/补通知。  
+
+---
+
+## 11. 可观测性
+- `payment_success_rate`  
+- `callback_delay`  
+- `pending_timeout_count`  
+- `reconcile_diff_count`  
+- `refund_success_rate`  
+
+---
+
+## 12. 安全合规
+- PCI-DSS 合规。  
+- 敏感数据加密与脱敏。  
+- 高风险交易二次验证。  
+
+---
+
+## 13. 成本取舍
+- 多渠道接入提升成功率但集成成本高。  
+- 更严格风控减少坏账但可能伤转化。  
+
+---
+
+## 14. Java 关键代码（4 段）
+```java
+public class PaymentService {
+  public long create(CreatePaymentCmd cmd) {
+    PaymentOrder exist = payRepo.findByMerchantAndIdem(cmd.merchantId(), cmd.idemKey());
+    if (exist != null) return exist.paymentId();
+    long id = idGen.nextId();
+    payRepo.insert(id, cmd);
+    outboxRepo.insert("PAYMENT_CREATED", id);
+    return id;
+  }
+}
+```
+
+```java
+public class CallbackService {
+  public void onCallback(ChannelCallback cb) {
+    PaymentOrder p = payRepo.get(cb.paymentId());
+    if (isFinal(p.status())) return; // 幂等
+    payRepo.updateStatus(cb.paymentId(), cb.success() ? "SUCCESS" : "FAILED");
+  }
+}
+```
+
+```java
+public class LedgerService {
+  public void book(long paymentId, long buyerAcc, long merchantAcc, long amount) {
+    ledgerRepo.insert(paymentId, buyerAcc, "DEBIT", amount);
+    ledgerRepo.insert(paymentId, merchantAcc, "CREDIT", amount);
+  }
+}
+```
+
+```java
+public class ReconcileService {
+  public void reconcile(long paymentId, String channelStatus, String localStatus) {
+    if (!Objects.equals(channelStatus, localStatus)) {
+      fixService.compensate(paymentId, channelStatus, localStatus);
+    }
+    reconcileRepo.save(paymentId, channelStatus, localStatus);
+  }
+}
+```
+
+---
+
+## 15. 测试策略
+- 支付回调重复测试。  
+- 渠道超时与补偿测试。  
+- 对账差异自动修复测试。  
+
+---
+
+## 16. 10 个例子
+1. 用户超时重试支付。  
+2. 回调重复推送 5 次。  
+3. 渠道返回未知状态。  
+4. 退款部分成功。  
+5. 支付成功但通知失败。  
+6. 对账发现本地少单。  
+7. 对账发现渠道多单。  
+8. 风控拒绝高风险交易。  
+9. 清结算批次延迟。  
+10. 节假日峰值通道切换。  
+
+---
+
+## 17. 面试追问
+- 如何避免重复扣款？  
+- 支付成功但业务失败怎么办？  
+- 对账怎么做自动化补偿？  
+
+---
+
+## 18. 新手路线 + Checklist
+- 先实现状态机和幂等，再做账本和对账。  
+- Checklist：状态、幂等、双记账、对账补偿都能讲。  
+
+---
+
+## 19. 30 秒总结
+- 支付系统最重要的是“正确性和可追溯性”。  
+- 面试里把状态机、幂等、账本、对账讲清，就是成熟答案。  

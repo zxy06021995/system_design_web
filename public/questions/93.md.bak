@@ -1,0 +1,220 @@
+# 母题 Q93：Fraud Detection System（新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 欺诈检测系统是“在毫秒级判断一笔行为是否可疑”。  
+2. 难点在于：既要拦截坏人，又要少误伤好人。  
+3. 面试高分关键：讲清规则引擎+模型协同、人工复核、申诉与回溯。  
+
+---
+
+## 1. 故事开场
+- 凌晨 3 点，同一个账号在 1 分钟内在 3 个国家尝试支付。  
+- 系统若不拦截可能造成损失；拦太多又会伤用户体验。  
+- 目标是风险与转化平衡。  
+
+---
+
+## 2. 白话术语
+| 术语 | 白话 |
+|---|---|
+| Rule Engine | 规则引擎（显式规则） |
+| ML Model | 机器学习评分 |
+| Risk Score | 风险分 |
+| False Positive | 误杀 |
+| False Negative | 漏判 |
+| Case Review | 人工复核 |
+| Chargeback | 拒付反馈 |
+
+---
+
+## 3. 需求澄清
+- 实时风险判定（支付/注册/登录）。  
+- 支持规则配置、模型打分、人工复核。  
+- 支持申诉与回溯。  
+
+非功能：  
+- 判定延迟 P95 < 50ms。  
+- 高可用 >= 99.95%。  
+
+---
+
+## 4. 容量估算
+- 峰值请求 100k QPS。  
+- 每次判定读取 50+ 特征。  
+- 需要在线特征缓存与高性能规则执行。  
+
+---
+
+## 5. 架构
+```text
+Risk API
+ -> Feature Service (online features)
+ -> Rule Engine
+ -> Model Scoring
+ -> Decision Engine (allow/challenge/reject)
+ -> Case Management (manual review)
+ -> Feedback Loop (chargeback, appeal)
+```
+
+---
+
+## 6. API
+- `POST /v1/risk/evaluate`  
+- `POST /v1/risk/rules`  
+- `POST /v1/risk/cases/{id}/review`  
+- `POST /v1/risk/appeals`  
+
+---
+
+## 7. 数据模型
+```sql
+CREATE TABLE risk_event (
+  event_id BIGINT PRIMARY KEY,
+  user_id BIGINT,
+  scene VARCHAR(32),            -- LOGIN/PAYMENT/REGISTER
+  feature_json JSON NOT NULL,
+  risk_score DOUBLE,
+  decision VARCHAR(16),         -- ALLOW/CHALLENGE/REJECT
+  ts TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE risk_case (
+  case_id BIGINT PRIMARY KEY,
+  event_id BIGINT NOT NULL,
+  status VARCHAR(16) NOT NULL,  -- OPEN/REVIEWED/CLOSED
+  reviewer_id BIGINT,
+  review_result VARCHAR(16),
+  ts TIMESTAMP NOT NULL
+);
+```
+
+---
+
+## 8. 核心流程
+1. 请求进入风险评估。  
+2. 拉特征（设备、行为、历史）。  
+3. 规则引擎先判高危规则。  
+4. 模型打分补充判断。  
+5. 决策：放行、二次验证、拒绝。  
+6. 结果回流训练与规则优化。  
+
+---
+
+## 9. 一致性与幂等
+- 风险评估接口按 `event_id` 幂等。  
+- 决策写日志可重放。  
+- 模型结果延迟可容忍，核心决策链路优先稳定。  
+
+---
+
+## 10. 可用性与容错
+- 模型服务超时：退化到规则引擎。  
+- 特征服务异常：使用默认特征并降级决策。  
+- 案件系统不可用不影响主链路（异步补录）。  
+
+---
+
+## 11. 可观测性
+- `risk_eval_p95`  
+- `reject_rate`  
+- `challenge_rate`  
+- `false_positive_rate`  
+- `chargeback_rate`  
+
+---
+
+## 12. 安全合规
+- 风险日志保留审计。  
+- PII 脱敏与权限分级。  
+- 模型决策可解释字段输出。  
+
+---
+
+## 13. 成本取舍
+- 更严格规则降低坏账但伤转化。  
+- 更复杂模型效果好但延迟和算力更高。  
+- 人审准确但成本高，需只处理边界样本。  
+
+---
+
+## 14. Java 关键代码（4 段）
+```java
+public class RuleEngine {
+  public RuleDecision eval(RiskContext ctx) {
+    if (ctx.loginFailCount5m() > 20) return RuleDecision.reject("TOO_MANY_FAILS");
+    if (ctx.countryMismatch()) return RuleDecision.challenge("GEO_MISMATCH");
+    return RuleDecision.pass();
+  }
+}
+```
+
+```java
+public class RiskScoringService {
+  public double score(FeatureVector fv) {
+    return model.predict(fv); // 0~1
+  }
+}
+```
+
+```java
+public class DecisionService {
+  public Decision decide(RuleDecision rule, double score) {
+    if (rule.isReject()) return Decision.REJECT;
+    if (score > 0.9) return Decision.REJECT;
+    if (score > 0.6 || rule.isChallenge()) return Decision.CHALLENGE;
+    return Decision.ALLOW;
+  }
+}
+```
+
+```java
+public class FeedbackIngestor {
+  public void onChargeback(long eventId) {
+    feedbackRepo.save(eventId, "CHARGEBACK");
+    trainer.enqueue(eventId);
+  }
+}
+```
+
+---
+
+## 15. 测试策略
+- 规则命中率测试。  
+- 模型线上 A/B 评估。  
+- 高峰延迟压测。  
+- 回放历史欺诈样本验证。  
+
+---
+
+## 16. 10 个例子
+1. 异地登录异常。  
+2. 设备指纹频繁切换。  
+3. 短时高频小额支付。  
+4. 新注册账号立即大额交易。  
+5. 黑名单卡号命中。  
+6. 人审判定误杀后放行。  
+7. 拒付回流更新规则。  
+8. 模型超时退化规则判定。  
+9. 风险阈值动态调整。  
+10. 节日活动期间策略放宽。  
+
+---
+
+## 17. 面试追问
+- 如何平衡拦截率和误杀率？  
+- 规则和模型冲突如何决策？  
+- 如何防对抗样本？  
+
+---
+
+## 18. 新手路线 + Checklist
+- 先做规则引擎，再接模型与人审。  
+- Checklist：实时判定、反馈闭环、误杀治理都能讲。  
+
+---
+
+## 19. 30 秒总结
+- 欺诈系统核心是“实时决策 + 反馈学习 + 人审兜底”。  
+- 面试把误杀/漏判平衡和闭环优化讲清，就是成熟方案。  

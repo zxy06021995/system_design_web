@@ -1,0 +1,338 @@
+# 母题 Q23：Uber 地理位置服务（新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 这题核心不是地图 UI，而是“实时定位 + 快速找附近司机 + 合理派单”。  
+2. 难点在于：位置更新频繁、查询低延迟、城市峰值高并发。  
+3. 面试高分关键：你要把“空间索引、调度策略、ETA 预测、故障兜底”讲完整。  
+
+---
+
+## 1. 先讲一个故事
+- 用户在机场下单，附近司机很多，但道路拥堵。  
+- 系统不能只选“直线最近”，要选“综合 ETA 最短且接单概率高”的司机。  
+- 司机位置每 2 秒更新一次，系统要实时反应。  
+
+---
+
+## 2. 术语白话翻译
+| 术语 | 白话解释 | 面试可复述 |
+|---|---|---|
+| Geohash | 地图网格编码 | “把地球切成小格子，便于检索” |
+| Cell | 网格单元 | “附近司机先在同格子找” |
+| ETA | 预计到达时间 | “不是直线距离，是路况时间” |
+| Dispatch | 派单 | “选最合适司机并发起订单” |
+| Surge | 动态加价 | “供需不平衡时涨价” |
+| Matching | 乘客司机匹配 | “按评分函数选人” |
+| Rebalance | 司机再平衡 | “引导司机去需求高区域” |
+| Location Stream | 位置流 | “司机持续上报坐标” |
+| Candidate Recall | 候选召回 | “先找一批可能司机” |
+| Ranking | 排序 | “再选最优司机” |
+
+---
+
+## 3. 需求澄清
+### 3.1 功能需求
+- 司机实时上报位置。  
+- 乘客请求打车时快速找附近司机。  
+- 估算 ETA 并排序派单。  
+- 支持司机接单、拒单、超时重试。  
+- 支持动态加价和取消逻辑。  
+
+### 3.2 非功能需求
+- 附近司机查询 P95 `< 100ms`。  
+- 派单决策 P95 `< 300ms`。  
+- 定位更新可用性 >= 99.9%。  
+- 服务可用性 >= 99.95%。  
+
+### 3.3 不做范围
+- 不做高级路径规划引擎自研（先用地图服务）。  
+- 不做跨城合并调度（按城市隔离）。  
+
+---
+
+## 4. 容量估算
+### 4.1 假设
+- 活跃司机：`2,000,000`  
+- 每司机 2 秒上报一次 -> `1,000,000 updates/s`  
+- 乘客下单峰值：`50,000 req/s`  
+
+### 4.2 结论
+- 位置流非常大，必须走流式处理 + 内存索引。  
+- 查询要依赖空间索引，不能全量扫描。  
+
+---
+
+## 5. 架构（简版 + 完整版）
+### 5.1 简版
+```text
+司机上报位置 -> 位置服务 -> 空间索引
+乘客下单 -> 召回附近司机 -> ETA排序 -> 派单
+```
+
+### 5.2 完整版
+```text
+Driver App -> Location Gateway -> Location Stream (Kafka)
+          -> Location Processor -> Geo Index (Redis/Memory + Geohash)
+
+Rider App -> Dispatch API
+         -> Candidate Recall (nearby cells)
+         -> ETA Service (map traffic)
+         -> Ranking Service
+         -> Dispatch Orchestrator (offer/timeout/retry)
+         -> Order Service
+
+Observability + Pricing Service + Fraud Service
+```
+
+---
+
+## 6. 核心模块
+### 6.1 位置上报
+- 驱动端上传 `(driverId, lat, lng, heading, speed, ts)`。  
+- 去抖（同位置重复更新可合并）。  
+
+### 6.2 空间索引
+- 按 Geohash 划分 cell。  
+- 查询时先找本 cell，再扩邻居 cell。  
+
+### 6.3 ETA 服务
+- 输入：起点（司机）、终点（乘客）。  
+- 输出：预计到达时间。  
+- 优先外部地图 API + 本地缓存。  
+
+### 6.4 派单编排
+- 候选召回 -> 排序 -> 发 offer -> 等待回应 -> 超时切下一个。  
+
+---
+
+## 7. API 设计
+### 7.1 司机上报位置
+`POST /v1/location/update`
+```json
+{
+  "driverId": 1001,
+  "lat": 31.2304,
+  "lng": 121.4737,
+  "speed": 36,
+  "ts": 1771900000123
+}
+```
+
+### 7.2 乘客请求附近司机
+`GET /v1/dispatch/nearby?lat=...&lng=...&radius=3000`
+
+### 7.3 创建派单
+`POST /v1/dispatch/order`
+
+### 7.4 司机接单响应
+`POST /v1/dispatch/offer/{offerId}/accept`
+
+---
+
+## 8. 数据模型
+```sql
+CREATE TABLE driver_state (
+  driver_id BIGINT PRIMARY KEY,
+  city_id INT NOT NULL,
+  status VARCHAR(16) NOT NULL, -- IDLE/BUSY/OFFLINE
+  lat DOUBLE,
+  lng DOUBLE,
+  geohash VARCHAR(16),
+  updated_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE dispatch_order (
+  order_id BIGINT PRIMARY KEY,
+  rider_id BIGINT NOT NULL,
+  city_id INT NOT NULL,
+  pickup_lat DOUBLE NOT NULL,
+  pickup_lng DOUBLE NOT NULL,
+  status VARCHAR(16) NOT NULL, -- CREATED/MATCHING/ASSIGNED/CANCELED
+  assigned_driver_id BIGINT,
+  created_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE dispatch_offer (
+  offer_id BIGINT PRIMARY KEY,
+  order_id BIGINT NOT NULL,
+  driver_id BIGINT NOT NULL,
+  rank_score DOUBLE NOT NULL,
+  eta_sec INT NOT NULL,
+  state VARCHAR(16) NOT NULL, -- PENDING/ACCEPTED/REJECTED/TIMEOUT
+  expire_at TIMESTAMP NOT NULL
+);
+```
+
+---
+
+## 9. 核心流程
+### 9.1 下单流程
+1. 乘客发起下单。  
+2. 按 geohash 召回附近司机。  
+3. 计算 ETA + 综合评分排序。  
+4. 依序发 offer，首个接受者获得订单。  
+
+### 9.2 司机拒单流程
+1. 司机拒绝/超时。  
+2. 编排器选下一候选并发 offer。  
+3. 超过阈值触发扩大搜索半径。  
+
+### 9.3 高峰流程（机场雨天）
+1. 需求暴涨，供需失衡。  
+2. 动态加价启动。  
+3. 再平衡策略引导空闲司机前往热点区。  
+
+---
+
+## 10. 一致性与幂等
+- 下单请求幂等键：`riderId + clientReqId`。  
+- 派单状态机防止重复分配。  
+- 司机 accept 要 compare-and-set，确保订单只给一个司机。  
+
+---
+
+## 11. 可用性与容错
+- 城市级隔离，单城故障不扩散。  
+- 地图 ETA 服务不可用时：退化成距离估算。  
+- 派单服务降级：缩短候选列表，优先快速分配。  
+
+---
+
+## 12. 可观测性
+- `location_update_qps`  
+- `nearby_query_p95`  
+- `dispatch_success_rate`  
+- `first_offer_accept_rate`  
+- `eta_error_p50/p95`  
+- `offer_timeout_rate`  
+
+告警示例：  
+- `dispatch_success_rate < 92%` 持续 5 分钟 -> P1。  
+- `nearby_query_p95 > 200ms` 持续 5 分钟 -> P1。  
+
+---
+
+## 13. 安全与风控
+- 位置上报签名校验，防伪造坐标。  
+- 异常轨迹检测（瞬移、漂移、GPS 欺诈）。  
+- 乘客与司机隐私数据脱敏。  
+
+---
+
+## 14. 成本与取舍
+- 高精度 ETA 成本高，可分层：核心链路精算，回退链路粗算。  
+- 高频定位上报可做动态频率（静止时降频）。  
+- 热点区域索引常驻内存，冷区可降级存储。  
+
+---
+
+## 15. Java 关键代码（4 段）
+### 15.1 Geohash 邻域召回
+```java
+public class NearbyRecallService {
+  public List<Long> recall(double lat, double lng, int radiusMeter) {
+    String cell = GeoHash.encode(lat, lng, 7);
+    List<String> neighbors = GeoHash.neighbors(cell);
+    List<String> cells = new ArrayList<>();
+    cells.add(cell);
+    cells.addAll(neighbors);
+    return geoIndex.batchGetDrivers(cells, radiusMeter);
+  }
+}
+```
+
+### 15.2 派单排序
+```java
+public class DispatchRanker {
+  public double score(int etaSec, double acceptProb, double driverRating) {
+    return -0.6 * etaSec + 0.3 * acceptProb + 0.1 * driverRating;
+  }
+}
+```
+
+### 15.3 分配原子更新
+```java
+public class AssignService {
+  public boolean assign(long orderId, long driverId) {
+    // compare-and-set，防止一个订单被多司机抢到
+    return orderRepo.casAssign(orderId, "MATCHING", driverId, "ASSIGNED") == 1;
+  }
+}
+```
+
+### 15.4 Offer 超时重试
+```java
+public class OfferOrchestrator {
+  public void handleTimeout(long offerId) {
+    Offer offer = offerRepo.get(offerId);
+    if (!"PENDING".equals(offer.state())) return;
+    offerRepo.markTimeout(offerId);
+    dispatchFlow.tryNextCandidate(offer.orderId());
+  }
+}
+```
+
+---
+
+## 16. 测试策略
+- 单测：评分函数、状态机、幂等。  
+- 压测：定位流百万级写入、派单高峰。  
+- 故障注入：地图服务超时、队列积压、索引节点故障。  
+
+---
+
+## 17. 丰富例子（10 个）
+1. 机场高峰需求暴涨。  
+2. 司机信号差导致位置延迟。  
+3. 司机拒单后快速换人。  
+4. ETA 服务超时回退直线估算。  
+5. 热点区域动态加价。  
+6. 司机作弊上报“瞬移”被拦截。  
+7. 乘客重复点击下单通过幂等防重。  
+8. 大雨天供需失衡触发再平衡。  
+9. 城市 A 故障，城市 B 不受影响。  
+10. 夜间低流量降低位置上报频率降本。  
+
+---
+
+## 18. 面试追问与可复述答案
+### Q1：为什么不是按距离最近派单？
+- “距离最近不等于到达最快，真实路况下要看 ETA。”  
+
+### Q2：怎么保证一个订单不会分给多个司机？
+- “分配时做 CAS 原子状态更新。”  
+
+### Q3：GPS 不准怎么办？
+- “做去抖、轨迹平滑、异常点过滤，并结合地图匹配。”  
+
+### Q4：高峰扛不住怎么办？
+- “缩短候选链路、降级 ETA、动态加价、城市级隔离。”  
+
+---
+
+## 19. 新手学习路线（7 天）
+1. 理解 geohash 与邻域搜索。  
+2. 实现基础 nearby 查询。  
+3. 实现派单状态机。  
+4. 加 ETA 缓存。  
+5. 加幂等与 CAS。  
+6. 加监控告警。  
+7. 按面试结构复述。  
+
+---
+
+## 20. Checklist
+- [ ] 能讲清 geohash 召回 + ETA 排序。  
+- [ ] 能讲清派单状态机与超时重试。  
+- [ ] 能讲清幂等与单订单唯一分配。  
+- [ ] 能说出关键指标与告警。  
+
+---
+
+## 21. 30 秒总结
+- Uber 地理服务核心是“实时定位 + 候选召回 + ETA 排序 + 派单编排”。  
+- 面试里讲清空间索引、状态机、故障降级和风控，基本就稳了。  

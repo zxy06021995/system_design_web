@@ -1,0 +1,233 @@
+# 母题 Q60：Task Management Application（新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 任务管理系统本质是“任务状态流转 + 团队协作 + 提醒通知”。  
+2. 难点在于多人并发编辑、权限控制、搜索与看板性能。  
+3. 面试高分关键：讲清状态机、权限模型、通知链路、审计与回滚。  
+
+---
+
+## 1. 故事开场
+- 团队在迭代中同时操作一个任务：产品改优先级、开发改状态、测试补备注。  
+- 如果没有并发控制，信息会互相覆盖。  
+- 系统要保证“谁改了什么、何时改、为什么改”可追溯。  
+
+---
+
+## 2. 名词白话
+| 术语 | 白话 |
+|---|---|
+| Kanban | 看板视图 |
+| Backlog | 待办池 |
+| Assignee | 负责人 |
+| Workflow | 状态流转规则 |
+| SLA | 任务响应/完成时限 |
+| Comment Thread | 评论串 |
+| Watcher | 关注人 |
+
+---
+
+## 3. 需求澄清
+- 支持创建任务、分配负责人、设置截止时间。  
+- 支持状态流转（TODO -> IN_PROGRESS -> DONE）。  
+- 支持评论、附件、@提醒。  
+- 支持列表/看板/筛选/搜索。  
+
+非功能：  
+- 页面查询 P95 < 300ms。  
+- 写操作可用性 >= 99.95%。  
+
+---
+
+## 4. 容量估算
+- 1000 万任务，活跃 100 万。  
+- 每天状态变更 2000 万次。  
+- 评论每天 500 万条。  
+
+---
+
+## 5. 架构
+```text
+Web/Mobile
+ -> API Gateway
+ -> Task Service (CRUD + workflow)
+ -> Comment Service
+ -> Notification Service
+ -> Search Service (ES)
+ -> Audit Log
+```
+
+---
+
+## 6. API 设计
+- `POST /v1/tasks`  
+- `PATCH /v1/tasks/{id}`  
+- `POST /v1/tasks/{id}/comments`  
+- `GET /v1/tasks?filter=...`  
+- `POST /v1/tasks/{id}/transition`  
+
+---
+
+## 7. 数据模型
+```sql
+CREATE TABLE task (
+  task_id BIGINT PRIMARY KEY,
+  project_id BIGINT NOT NULL,
+  title VARCHAR(256) NOT NULL,
+  description TEXT,
+  status VARCHAR(32) NOT NULL,
+  priority VARCHAR(16) NOT NULL,
+  assignee_id BIGINT,
+  due_time TIMESTAMP,
+  version BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE task_comment (
+  comment_id BIGINT PRIMARY KEY,
+  task_id BIGINT NOT NULL,
+  author_id BIGINT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE task_audit (
+  id BIGINT PRIMARY KEY,
+  task_id BIGINT NOT NULL,
+  actor_id BIGINT NOT NULL,
+  action VARCHAR(64) NOT NULL,
+  before_json JSON,
+  after_json JSON,
+  ts TIMESTAMP NOT NULL
+);
+```
+
+---
+
+## 8. 核心流程
+1. 创建任务并指派负责人。  
+2. 状态流转前校验规则（如 DONE 前必须有验收人）。  
+3. 状态变更触发通知。  
+4. 搜索索引异步更新。  
+
+---
+
+## 9. 一致性与并发
+- 乐观锁（version）防止并发覆盖。  
+- 关键变更写审计日志。  
+- 通知采用 outbox 异步，主事务不阻塞。  
+
+---
+
+## 10. 可用性与容错
+- 搜索服务故障时回退数据库查询（能力受限）。  
+- 通知失败可重试，不影响任务主操作成功。  
+- 审计日志写失败触发高优先级告警。  
+
+---
+
+## 11. 可观测性
+- `task_write_p95`  
+- `transition_fail_rate`  
+- `notification_delay`  
+- `search_index_lag`  
+
+---
+
+## 12. 安全与权限
+- RBAC：管理员、成员、访客。  
+- 项目级和任务级权限控制。  
+- 敏感项目审计不可删除。  
+
+---
+
+## 13. 成本取舍
+- 强一致搜索成本高，通常异步索引容忍秒级延迟。  
+- 大评论历史可冷热分层。  
+
+---
+
+## 14. Java 关键代码（4 段）
+```java
+public class TaskService {
+  public Task create(CreateTaskCmd cmd) {
+    Task t = Task.newTask(cmd.projectId(), cmd.title(), cmd.assigneeId());
+    taskRepo.insert(t);
+    outboxRepo.insert("TASK_CREATED", t.getTaskId());
+    return t;
+  }
+}
+```
+
+```java
+public class TransitionService {
+  public void transition(long taskId, String toStatus, long actorId) {
+    Task task = taskRepo.get(taskId);
+    workflowValidator.check(task.getStatus(), toStatus, task);
+    taskRepo.updateStatus(taskId, toStatus, task.getVersion());
+    auditRepo.log(taskId, actorId, "TRANSITION", task.getStatus(), toStatus);
+  }
+}
+```
+
+```java
+public class CommentService {
+  public void addComment(long taskId, long authorId, String content) {
+    commentRepo.insert(taskId, authorId, content);
+    notificationService.notifyWatchers(taskId, authorId, "COMMENT_ADDED");
+  }
+}
+```
+
+```java
+public class SearchIndexer {
+  public void onTaskEvent(TaskEvent e) {
+    searchRepo.upsert(e.taskId(), e.title(), e.status(), e.assigneeId());
+  }
+}
+```
+
+---
+
+## 15. 测试策略
+- 单测：状态机合法流转。  
+- 压测：看板批量查询。  
+- 故障注入：搜索不可用、通知积压。  
+
+---
+
+## 16. 10 个例子
+1. 任务重复提交防重。  
+2. 状态流转非法被拒绝。  
+3. 多人并发改优先级。  
+4. 评论 @ 人触发通知。  
+5. 截止日期临近提醒。  
+6. 搜索延迟导致短暂不一致。  
+7. 项目权限不足无法编辑。  
+8. 删除任务走软删。  
+9. 任务模板快速创建。  
+10. 看板拖拽触发状态变更。  
+
+---
+
+## 17. 面试追问
+- 如何处理并发编辑冲突？  
+- 看板性能如何优化？  
+- 通知失败会不会影响主流程？  
+
+---
+
+## 18. 新手路线 + Checklist
+- 先做任务 CRUD，再做状态机、通知、搜索。  
+- Checklist：状态机、权限、审计、通知都能讲。  
+
+---
+
+## 19. 30 秒总结
+- 任务管理系统核心是“状态机 + 协作 + 可追溯”。  
+- 面试里把并发、权限、通知、搜索一致性讲清就能拿高分。  

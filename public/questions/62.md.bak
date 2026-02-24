@@ -1,0 +1,220 @@
+# 母题 Q62：Container Orchestration（容器编排，新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 容器编排系统是“把应用稳定运行在一堆机器上”的控制系统。  
+2. 难点是调度、服务发现、滚动发布、自动扩缩容和故障自愈。  
+3. 面试高分关键：讲清控制面/数据面、调度策略、发布回滚、资源隔离。  
+
+---
+
+## 1. 故事开场
+- 业务上线一个新版本，不能中断服务。  
+- 某台机器故障后，容器要自动迁移。  
+- 高峰流量来时要自动扩容。  
+
+---
+
+## 2. 白话术语
+| 术语 | 白话 |
+|---|---|
+| Pod | 最小部署单元 |
+| Scheduler | 调度器，决定放到哪台机 |
+| Service Discovery | 服务发现，找到服务地址 |
+| Rolling Update | 滚动发布 |
+| HPA | 按指标自动扩缩容 |
+| Liveness/Readiness Probe | 存活/就绪探针 |
+| Namespace | 逻辑隔离空间 |
+
+---
+
+## 3. 需求澄清
+- 支持应用部署、扩缩容、回滚。  
+- 支持服务发现与负载均衡。  
+- 支持健康检查和自动重调度。  
+
+非功能：  
+- 控制面高可用。  
+- 发布不中断。  
+
+---
+
+## 4. 容量估算
+- 集群节点 5000 台，Pod 50 万。  
+- 调度吞吐需求：数千 Pod/s 峰值。  
+
+---
+
+## 5. 架构
+```text
+API Server
+ -> Scheduler
+ -> Controller Manager
+ -> State Store (etcd)
+Node Agent (kubelet-like) + Runtime
+Service Proxy / Ingress
+```
+
+---
+
+## 6. API 设计
+- `POST /v1/workloads/deployments`  
+- `POST /v1/workloads/{id}/scale`  
+- `POST /v1/workloads/{id}/rollback`  
+- `GET /v1/nodes/health`  
+
+---
+
+## 7. 数据模型
+```sql
+CREATE TABLE workload (
+  workload_id BIGINT PRIMARY KEY,
+  namespace VARCHAR(64) NOT NULL,
+  image VARCHAR(256) NOT NULL,
+  replicas INT NOT NULL,
+  strategy VARCHAR(32) NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE pod_instance (
+  pod_id BIGINT PRIMARY KEY,
+  workload_id BIGINT NOT NULL,
+  node_id BIGINT NOT NULL,
+  phase VARCHAR(16) NOT NULL, -- PENDING/RUNNING/FAILED
+  cpu_milli INT NOT NULL,
+  mem_mb INT NOT NULL
+);
+```
+
+---
+
+## 8. 核心流程
+1. 提交 Deployment。  
+2. Scheduler 选择节点。  
+3. Node Agent 拉镜像并启动容器。  
+4. Readiness 通过后接入流量。  
+5. 滚动发布按批次替换旧实例。  
+
+---
+
+## 9. 调度策略
+- 资源匹配：CPU、内存、磁盘。  
+- 亲和/反亲和：副本分散。  
+- 污点容忍：特殊节点专用。  
+- 优先级抢占：关键业务优先。  
+
+---
+
+## 10. 可用性与容错
+- 控制面多副本。  
+- 节点故障自动重调度。  
+- 发布异常自动回滚。  
+
+---
+
+## 11. 可观测性
+- `pod_start_latency`  
+- `scheduler_queue_depth`  
+- `deployment_success_rate`  
+- `node_not_ready_count`  
+
+---
+
+## 12. 安全与隔离
+- Namespace + RBAC。  
+- NetworkPolicy 限制服务互访。  
+- Secret 管理。  
+
+---
+
+## 13. 成本与取舍
+- 过度预留资源会浪费。  
+- 过度压榨会导致抖动。  
+- 需要用 requests/limits 平衡稳定和利用率。  
+
+---
+
+## 14. Java 关键代码（4 段）
+```java
+public class SimpleScheduler {
+  public Node pickNode(PodSpec pod, List<Node> nodes) {
+    return nodes.stream()
+      .filter(n -> n.cpuFree() >= pod.cpuReq() && n.memFree() >= pod.memReq())
+      .max(Comparator.comparingInt(Node::score))
+      .orElseThrow();
+  }
+}
+```
+
+```java
+public class RollingUpdater {
+  public void rollout(Deployment d) {
+    int batch = Math.max(1, d.replicas() / 10);
+    while (hasOldPods(d)) {
+      createNewPods(d, batch);
+      waitReadiness(d, batch);
+      deleteOldPods(d, batch);
+    }
+  }
+}
+```
+
+```java
+public class HpaController {
+  public int desiredReplicas(int current, double cpuUsage, double target) {
+    return Math.max(1, (int) Math.ceil(current * cpuUsage / target));
+  }
+}
+```
+
+```java
+public class SelfHealingController {
+  public void reconcile(Node node) {
+    if (!node.ready()) {
+      List<Pod> pods = podRepo.listByNode(node.id());
+      pods.forEach(p -> scheduler.reschedule(p));
+    }
+  }
+}
+```
+
+---
+
+## 15. 测试策略
+- 单测：调度打分与亲和规则。  
+- 压测：批量发布、扩容。  
+- 故障注入：节点宕机、网络分区。  
+
+---
+
+## 16. 10 个例子
+1. 发布新版本滚动升级。  
+2. 高峰 CPU 80% 触发扩容。  
+3. 节点宕机自动迁移。  
+4. Readiness 失败不接流量。  
+5. 版本异常快速回滚。  
+6. 命名空间隔离测试环境。  
+7. 高优先级任务抢占低优先级。  
+8. 镜像拉取失败重试。  
+9. 资源碎片导致调度失败。  
+10. 控制面升级不中断。  
+
+---
+
+## 17. 面试追问
+- 调度器如何避免热点节点？  
+- 滚动发布如何保证零停机？  
+- etcd 故障会怎样？  
+
+---
+
+## 18. 新手路线 + Checklist
+- 先做简版 scheduler，再做 rollout/hpa。  
+- Checklist：调度、发布、扩缩容、容错都能讲。  
+
+---
+
+## 19. 30 秒总结
+- 编排系统核心是“自动化调度 + 自愈 + 发布治理”。  
+- 面试里把控制面、调度策略、回滚机制讲清就是高分。  

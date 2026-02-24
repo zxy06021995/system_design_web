@@ -1,0 +1,201 @@
+# 母题 Q32：Google Search Engine（新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 搜索引擎核心是“先建好索引，再高速检索并排序”。  
+2. 难点在于：网页规模极大、更新频繁、查询延迟要求很低。  
+3. 面试高分关键：讲清爬虫、倒排索引、召回排序、增量更新、质量评估。  
+
+---
+
+## 1. 小故事开场
+- 用户输入“上海天气”。  
+- 系统要在几十毫秒内返回相关网页。  
+- 用户第二天再搜，结果要反映最新页面变化。  
+
+---
+
+## 2. 术语白话
+| 术语 | 白话解释 | 面试可复述 |
+|---|---|---|
+| Crawler | 爬虫 | “把网页抓回来” |
+| Inverted Index | 倒排索引 | “词 -> 出现在哪些文档” |
+| Tokenization | 分词 | “把句子拆成词” |
+| Recall | 召回 | “先找一批可能相关结果” |
+| Ranking | 排序 | “再按相关性排前后” |
+| BM25 | 经典相关性算法 | “词频+文档长度加权” |
+| Freshness | 新鲜度 | “新内容适当加权” |
+| Shard | 分片 | “索引按块分到多机器” |
+| Merge | 索引合并 | “小索引并成大索引” |
+| Query Cache | 查询缓存 | “热门词直接返回” |
+
+---
+
+## 3. 需求澄清
+### 功能
+- 抓取网页并解析内容。  
+- 构建倒排索引并支持关键词检索。  
+- 支持多字段排序（相关性、新鲜度、权威度）。  
+
+### 非功能
+- 查询 P95 `< 200ms`。  
+- 高可用 >= 99.95%。  
+- 支持增量更新，小时级可见。  
+
+### 不做
+- 不做全网实时秒级更新。  
+- 不做复杂个性化推荐（首版可弱化）。  
+
+---
+
+## 4. 容量估算
+- 假设网页总量 100 亿，平均 20KB。  
+- 倒排索引大小可达原文多倍，需 PB 级存储规划。  
+- 查询峰值 300k QPS，必须多级缓存 + 分片并行。  
+
+---
+
+## 5. 架构
+```text
+Crawler -> Parse/Clean -> Index Builder -> Index Shards
+Query API -> Query Parser -> Recall (inverted index) -> Ranker -> Result Merge
+                                 -> Cache -> Return
+```
+
+---
+
+## 6. API 设计
+- `GET /v1/search?q=...&page=1&size=10`
+- `POST /v1/index/doc`（内部）  
+- `POST /v1/index/rebuild`（内部）  
+
+---
+
+## 7. 数据模型（简版）
+```sql
+CREATE TABLE doc_meta (
+  doc_id BIGINT PRIMARY KEY,
+  url VARCHAR(1024) NOT NULL,
+  title VARCHAR(512),
+  lang VARCHAR(16),
+  crawl_time TIMESTAMP NOT NULL,
+  score_static DOUBLE
+);
+```
+
+倒排项（逻辑）：
+- term -> [(doc_id, tf, positions, field_mask)]  
+
+---
+
+## 8. 核心流程
+1. 抓取网页。  
+2. 解析、清洗、去重。  
+3. 分词并构建倒排。  
+4. 查询时先召回候选。  
+5. 排序重排后返回。  
+
+---
+
+## 9. 一致性与更新
+- 索引是最终一致，不追求写后立刻全网可见。  
+- 增量索引 + 定期 merge。  
+- 旧索引和新索引双读切换，失败可回滚。  
+
+---
+
+## 10. 可用性容错
+- 分片副本容灾。  
+- 某分片超时可降级返回 partial。  
+- 热门查询缓存兜底。  
+
+---
+
+## 11. 观测指标
+- `crawl_success_rate`  
+- `index_build_lag`  
+- `query_p95/p99`  
+- `cache_hit_rate`  
+- `top_query_no_result_rate`  
+
+---
+
+## 12. 成本取舍
+- 更高召回率会增加排序成本。  
+- 更频繁更新会增加索引构建成本。  
+- 热词缓存显著省成本。  
+
+---
+
+## 13. Java 关键代码（4 段）
+```java
+public class QueryParser {
+  public List<String> parse(String q) {
+    return tokenizer.tokenize(q.toLowerCase(Locale.ROOT));
+  }
+}
+```
+
+```java
+public class RecallService {
+  public Set<Long> recall(List<String> terms) {
+    Set<Long> docs = new HashSet<>();
+    for (String t : terms) docs.addAll(indexRepo.postings(t));
+    return docs;
+  }
+}
+```
+
+```java
+public class Bm25Ranker {
+  public double score(int tf, int df, int docLen, int avgLen, int totalDocs) {
+    double idf = Math.log((totalDocs - df + 0.5) / (df + 0.5) + 1);
+    double k1 = 1.2, b = 0.75;
+    return idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * docLen / (double) avgLen));
+  }
+}
+```
+
+```java
+public class MergeService {
+  public List<Result> topK(List<List<Result>> shardResults, int k) {
+    PriorityQueue<Result> pq = new PriorityQueue<>(Comparator.comparingDouble(Result::score).reversed());
+    shardResults.forEach(pq::addAll);
+    List<Result> out = new ArrayList<>();
+    while (!pq.isEmpty() && out.size() < k) out.add(pq.poll());
+    return out;
+  }
+}
+```
+
+---
+
+## 14. 10 个例子
+1. 热词“天气”缓存命中。  
+2. 新网页刚发布暂未入索引。  
+3. 某分片超时返回 partial。  
+4. 垃圾页面被质量模型降权。  
+5. 同义词“手机/移动电话”扩展召回。  
+6. 拼写纠错“shnaghai -> shanghai”。  
+7. 站点宕机后降级展示快照。  
+8. 爬虫被 robots 限制。  
+9. 索引 merge 期间查询不受影响。  
+10. 热点新闻被 freshness 提权。  
+
+---
+
+## 15. 面试追问
+- 为什么倒排索引比正排更适合搜索？  
+- BM25 和向量检索如何组合？  
+- 如何处理“无结果”查询？  
+
+---
+
+## 16. 新手路线 + Checklist
+- 先做 mini 倒排索引原型，再加排序和缓存。  
+- Checklist：能讲抓取、索引、查询、更新、容错、指标。  
+
+---
+
+## 17. 30 秒总结
+- 搜索引擎核心链路是“抓取 -> 索引 -> 召回 -> 排序 -> 返回”。  
+- 面试里把索引结构、更新策略和排序取舍讲清，就很稳。  

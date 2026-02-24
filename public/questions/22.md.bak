@@ -1,0 +1,486 @@
+# 母题 Q22：视频流系统（YouTube 类，新手能懂 + 面试能讲清）
+
+## 0. 先用三句话讲明白这题
+1. 视频系统不是“存文件+播放”这么简单，而是“上传、转码、分发、播放、质量闭环”的整条流水线。  
+2. 最大难点是：流量峰值高、视频体积大、用户对卡顿极其敏感。  
+3. 面试高分关键：讲清 ABR（自适应码率）、CDN 策略、转码队列、QoE 指标和降本方案。  
+
+---
+
+## 1. 先讲一个真实故事（最好开场）
+### 场景
+- 创作者上传一个 4K、20 分钟视频。  
+- 100 万用户在晚高峰同时观看。  
+- 用户网络从 Wi-Fi 切到 4G 再到地铁弱网。  
+
+### 问题
+- 怎么让视频尽快可播？  
+- 怎么避免卡顿？  
+- 怎么控制带宽和转码成本？  
+
+### 我们要做到
+- 上传后可快速“先低清可播，再逐步补全高清”。  
+- 网络变差时自动降码率，尽量不停顿。  
+- 热门视频靠 CDN，源站不被打爆。  
+
+---
+
+## 2. 把抽象名词翻译成白话
+| 术语 | 白话解释 | 面试可直接说法 |
+|---|---|---|
+| Ingest | 上传接入 | “把视频稳定收进来” |
+| Transcoding | 转码 | “把一个原视频转成多清晰度” |
+| ABR | 自适应码率 | “网好就高清，网差就降清晰” |
+| HLS/DASH | 分片播放协议 | “视频切成小段边下边播” |
+| Manifest | 播放清单 | “播放器先拿到可选码率目录” |
+| CDN | 内容分发网络 | “离用户近的节点缓存视频” |
+| QoE | 播放体验指标 | “卡不卡、快不快、清不清晰” |
+| Rebuffer | 卡顿缓冲 | “播放中断，转圈圈” |
+| DRM | 数字版权保护 | “防盗播、防非法下载” |
+| Hot Content | 热门内容 | “需要提前预热 CDN” |
+
+---
+
+## 3. 需求澄清（Functional / Non-Functional / 不做）
+### 3.1 功能需求
+- 支持视频上传、断点续传、秒传（可选）。  
+- 支持转码生成多清晰度（240p/480p/720p/1080p/4K）。  
+- 支持 HLS/DASH 播放。  
+- 支持点赞、播放计数、评论（可后置）。  
+- 支持版权下架与内容审核。  
+
+### 3.2 非功能需求
+- 上传成功率高（>= 99.9%）。  
+- 上传后“首可播时间”尽量短（例如 < 60 秒可低清播放）。  
+- 播放首帧时间 P95 < 1.5s。  
+- 卡顿率（rebuffer ratio）可控。  
+- 可用性 >= 99.95%。  
+
+### 3.3 第一版不做
+- 不做直播（直播和点播架构差异大）。  
+- 不做复杂剪辑能力。  
+- 不做全球强一致统计。  
+
+### 3.4 面试开口模板
+“我按两条主链路来讲：上传转码链路、播放分发链路。  
+然后补上 QoE 观测和降本策略。”  
+
+---
+
+## 4. 容量估算（一步一步算）
+### 4.1 假设
+- 日上传视频：`5,000,000` 条  
+- 平均视频大小：`80MB`  
+- 日播放请求：`3,000,000,000`  
+- 峰值播放 QPS 系数：`6x`  
+
+### 4.2 结果
+- 日上传流量：`~400TB/day`  
+- 平均播放 QPS：`3,000,000,000 / 86400 ≈ 34,722`  
+- 峰值播放 QPS：`≈ 208,000`  
+- 若平均码率 2Mbps，峰值出口带宽需求极高，必须依赖 CDN。  
+
+### 4.3 关键结论
+- 源站不能直出，必须 CDN 承载绝大多数流量。  
+- 转码集群要按“上传峰值 + 重试 + 多码率倍数”规划。  
+
+---
+
+## 5. 架构：先讲简版，再讲完整版
+### 5.1 简版
+```text
+上传 -> 存储 -> 转码 -> CDN -> 播放器
+```
+
+### 5.2 完整版
+```text
+Upload SDK
+  -> Ingest API (auth, multipart upload)
+    -> Object Storage (raw video)
+    -> Transcode Queue (Kafka/SQS)
+      -> Transcode Workers (multi-bitrate)
+      -> Packaging Service (HLS/DASH segments + manifest)
+      -> Metadata DB (video state, profiles, drm)
+    -> CDN (edge cache)
+      -> Player SDK (ABR, retry, metrics)
+    -> QoE Pipeline (startup time, rebuffer, bitrate switches)
+```
+
+### 5.3 每层一句话职责
+- Ingest：高可靠接收入库。  
+- Transcode：计算密集，异步处理。  
+- Packaging：产出分片和清单。  
+- CDN：扛流量和降低延迟。  
+- Player：按网络实时选码率。  
+
+---
+
+## 6. 核心模块讲透
+### 6.1 上传模块
+- 支持分片上传、断点续传。  
+- 校验哈希防重复。  
+- 上传完成后触发转码任务。  
+
+### 6.2 转码模块
+- 同一源视频产出多码率版本。  
+- 优先产出低清版本实现“快速可播”。  
+- 重试失败任务并记录失败原因。  
+
+### 6.3 打包模块
+- HLS：`.m3u8 + .ts`  
+- DASH：`.mpd + segments`  
+- 片段建议 2~6 秒，平衡切换灵敏度与请求开销。  
+
+### 6.4 播放器模块
+- 首次根据网络选初始码率。  
+- 播放中动态切码率（ABR）。  
+- 弱网时优先不卡顿而非清晰度。  
+
+---
+
+## 7. API 设计（带示例）
+### 7.1 创建上传会话
+`POST /v1/videos/upload-sessions`
+
+Response:
+```json
+{
+  "uploadSessionId": "us-1001",
+  "partSize": 5242880,
+  "uploadUrls": ["..."],
+  "expireAt": 1772000000
+}
+```
+
+### 7.2 完成上传
+`POST /v1/videos/{videoId}/complete`
+
+### 7.3 查询转码状态
+`GET /v1/videos/{videoId}/status`
+
+### 7.4 获取播放信息
+`GET /v1/videos/{videoId}/play`
+
+Response:
+```json
+{
+  "manifestUrl": "https://cdn.xxx.com/v/90001/master.m3u8",
+  "drmToken": "token-xxx",
+  "subtitles": ["zh", "en"]
+}
+```
+
+### 7.5 上报播放质量
+`POST /v1/qoe/events`
+
+---
+
+## 8. 数据模型（SQL + 白话）
+```sql
+CREATE TABLE video_asset (
+  video_id BIGINT PRIMARY KEY,
+  owner_id BIGINT NOT NULL,
+  title VARCHAR(256) NOT NULL,
+  raw_object_key VARCHAR(512) NOT NULL,
+  status VARCHAR(32) NOT NULL,      -- UPLOADING/TRANSCODING/READY/FAILED/BLOCKED
+  duration_ms BIGINT,
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE transcode_job (
+  job_id BIGINT PRIMARY KEY,
+  video_id BIGINT NOT NULL,
+  profile VARCHAR(64) NOT NULL,     -- 480p/720p/1080p...
+  state VARCHAR(32) NOT NULL,       -- PENDING/RUNNING/SUCCESS/FAILED
+  retry_count INT NOT NULL DEFAULT 0,
+  worker_id VARCHAR(64),
+  updated_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE playback_profile (
+  video_id BIGINT NOT NULL,
+  profile VARCHAR(64) NOT NULL,
+  bitrate INT NOT NULL,
+  manifest_path VARCHAR(512) NOT NULL,
+  drm_scheme VARCHAR(32),
+  PRIMARY KEY (video_id, profile)
+);
+```
+
+```sql
+CREATE TABLE qoe_event (
+  id BIGINT PRIMARY KEY,
+  video_id BIGINT NOT NULL,
+  user_id BIGINT,
+  startup_ms INT,
+  rebuffer_ms INT,
+  avg_bitrate INT,
+  network_type VARCHAR(16),
+  ts TIMESTAMP NOT NULL
+);
+```
+
+---
+
+## 9. 协议与 ABR（面试重点）
+### 9.1 HLS 基本结构
+- `master.m3u8`：列出不同码率变体。  
+- `variant.m3u8`：列出具体分片。  
+- `.ts/.m4s`：实际视频片段。  
+
+### 9.2 ABR 选择逻辑（简化）
+- 初始：选保守码率，先快起播。  
+- 运行中：根据吞吐、缓冲区长度、卡顿情况动态调码率。  
+- 原则：优先不卡顿，再追求高清。  
+
+### 9.3 面试一句话
+“ABR 不是为了永远最清晰，而是为了总体体验最好。”  
+
+---
+
+## 10. 核心流程（面试必讲）
+### 10.1 上传转码流程
+1. 客户端分片上传对象存储。  
+2. 完成后写 `video_asset=UPLOADED` 并发转码任务。  
+3. 转码成功写 `playback_profile`。  
+4. 生成 manifest 并 CDN 预热。  
+5. 状态变为 `READY`。  
+
+### 10.2 播放流程
+1. 客户端请求播放信息。  
+2. 拿到 manifest URL。  
+3. 播放器根据 ABR 拉取分片。  
+4. 上报 QoE 指标。  
+
+### 10.3 弱网流程（例子）
+1. 检测吞吐下降、缓冲低。  
+2. 立即切到低码率。  
+3. 网络恢复后再逐步升码率。  
+
+### 10.4 热门视频流程
+1. 发布后播放激增。  
+2. CDN 命中率下降触发预热。  
+3. 拉高热门分片缓存 TTL。  
+
+---
+
+## 11. 一致性、事务、幂等（说清边界）
+### 11.1 一致性边界
+- 元数据状态变更要有序（UPLOADING -> READY）。  
+- 播放计数可最终一致。  
+
+### 11.2 幂等
+- 上传完成接口使用 `uploadSessionId` 幂等。  
+- 转码任务用 `video_id + profile` 唯一键防重复。  
+
+### 11.3 事务边界
+- 状态流转与任务入队同事务或 Outbox。  
+- 分发与上报不阻塞核心播放链路。  
+
+---
+
+## 12. 可用性与容错
+### 12.1 常见故障
+- 转码集群积压。  
+- CDN 某区域命中率骤降。  
+- 播放器 SDK 升级导致 crash。  
+- 对象存储短时波动。  
+
+### 12.2 对应策略
+- 转码：优先队列（低清优先）+ 弹性扩容。  
+- CDN：多 CDN + 回源保护。  
+- 播放器：灰度发布 + 回滚。  
+- 存储：重试 + 多 AZ。  
+
+### 12.3 RTO / RPO
+- RTO `< 15 min`（区域故障切换）  
+- RPO：视频元数据接近 0，播放统计可容忍分钟级延迟。  
+
+---
+
+## 13. 可观测性（QoE 是核心）
+### 13.1 必看指标
+- `first_frame_time_p95`  
+- `rebuffer_ratio`  
+- `avg_watch_time`  
+- `cdn_hit_ratio`  
+- `transcode_queue_lag`  
+- `ready_time_after_upload`  
+
+### 13.2 告警阈值示例
+- `rebuffer_ratio > 3%` 持续 10 分钟 -> P1  
+- `cdn_hit_ratio < 85%` 持续 5 分钟 -> P1  
+- `transcode_queue_lag > 15min` -> P1  
+
+### 13.3 面试一句话
+- “视频业务的真北指标不是 QPS，而是 QoE。”  
+
+---
+
+## 14. 安全与合规
+- 视频访问 token 鉴权，防盗链。  
+- DRM（Widevine/FairPlay）可选。  
+- 版权投诉后可快速下架。  
+- 内容审核（涉黄涉暴）接入异步审核流水线。  
+
+---
+
+## 15. 成本与取舍
+### 15.1 主要成本
+- 存储成本（原片+多码率）。  
+- 转码计算成本。  
+- CDN 出口带宽成本。  
+
+### 15.2 降本策略
+- 冷门视频按需转码（不是全部 profile 都提前转）。  
+- 长尾视频降副本/冷存。  
+- 热门视频预热 CDN 提升命中，减少回源。  
+
+### 15.3 典型取舍
+- 追求极低首帧时间会增加预热成本。  
+- 追求极高画质会增加带宽和转码成本。  
+
+---
+
+## 16. Java 关键代码（加注释）
+### 16.1 上传完成与任务入队（幂等）
+```java
+public class UploadService {
+  public void completeUpload(long videoId, String uploadSessionId) {
+    if (sessionRepo.isCompleted(uploadSessionId)) return; // 幂等
+
+    Transaction tx = txManager.begin();
+    try {
+      videoRepo.markUploaded(videoId);
+      outboxRepo.insert("VIDEO_UPLOADED", videoId);
+      sessionRepo.markCompleted(uploadSessionId);
+      tx.commit();
+    } catch (Exception e) {
+      tx.rollback();
+      throw e;
+    }
+  }
+}
+```
+
+### 16.2 转码任务消费者
+```java
+public class TranscodeWorker {
+  public void handle(VideoUploadedEvent event) {
+    for (String profile : List.of("480p", "720p", "1080p")) {
+      if (jobRepo.exists(event.videoId(), profile)) continue;
+      jobRepo.create(event.videoId(), profile);
+      ffmpegService.transcode(event.videoId(), profile);
+      packager.packageToHls(event.videoId(), profile);
+      jobRepo.markSuccess(event.videoId(), profile);
+    }
+    videoRepo.markReadyIfAllProfilesDone(event.videoId());
+  }
+}
+```
+
+### 16.3 ABR 决策（简化示意）
+```java
+public class AbrSelector {
+  public String chooseProfile(int throughputKbps, int bufferMs) {
+    if (bufferMs < 3000 || throughputKbps < 1200) return "480p";
+    if (throughputKbps < 2500) return "720p";
+    return "1080p";
+  }
+}
+```
+
+### 16.4 QoE 上报聚合
+```java
+public class QoeService {
+  public void ingest(QoeEvent e) {
+    qoeRepo.insert(e);
+    if (e.rebufferMs() > 2000) {
+      alertCounter.increment("high_rebuffer");
+    }
+  }
+}
+```
+
+---
+
+## 17. 丰富例子（10 个）
+1. **上传中断**：用户断网后续传，不用重传 80MB。  
+2. **首可播优化**：先转 480p，30 秒内可播。  
+3. **弱网切码率**：4G 抖动时从 1080p 自动降到 480p。  
+4. **热门爆发**：新热视频 10 分钟冲上首页，CDN 预热救场。  
+5. **转码失败重试**：某 profile 转码失败，重试 3 次后告警人工。  
+6. **版权下架**：收到投诉后 1 分钟内全网不可播放。  
+7. **多 CDN 切换**：某 CDN 区域故障，流量切到备份 CDN。  
+8. **播放器 Bug 回滚**：新 SDK 卡顿率暴涨，灰度回滚。  
+9. **长尾降本**：冷门视频只保留 480p，节省存储。  
+10. **QoE 驱动优化**：发现首帧慢，调整清单和分片长度。  
+
+---
+
+## 18. 测试策略（面试加分）
+### 18.1 单测
+- 状态机测试（UPLOADING->READY）。  
+- ABR 选择规则测试。  
+
+### 18.2 压测
+- 上传峰值压测。  
+- 热门播放峰值压测。  
+
+### 18.3 故障注入
+- 转码节点挂掉。  
+- CDN 回源超时。  
+- 存储短时不可用。  
+
+### 18.4 回归
+- 播放器版本兼容回归（老设备/新设备）。  
+
+---
+
+## 19. 面试高频追问 + 可直接复述答案
+### Q1：为什么一定要多码率？
+- “因为网络条件差异大，多码率 + ABR 才能兼顾不卡和清晰。”  
+
+### Q2：怎么降低首可播时间？
+- “低清优先转码、边转边可播、清单尽快可用。”  
+
+### Q3：CDN 命中率低怎么办？
+- “热点预热、合理 TTL、多 CDN 调度、减少小文件抖动。”  
+
+### Q4：怎么衡量体验？
+- “看 QoE：首帧、卡顿率、平均观看时长，不只看请求成功率。”  
+
+### Q5：如何降本？
+- “长尾按需转码，冷热分层，优化 CDN 命中减少回源。”  
+
+---
+
+## 20. 新手学习路线（7 天）
+1. 第 1 天：理解 HLS/DASH 基本结构。  
+2. 第 2 天：做分片上传和断点续传。  
+3. 第 3 天：接入 FFmpeg 基础转码。  
+4. 第 4 天：实现 manifest + 播放器 ABR 简版。  
+5. 第 5 天：接入 CDN 和缓存策略。  
+6. 第 6 天：接 QoE 指标采集和 Grafana。  
+7. 第 7 天：按面试结构讲一遍并复盘。  
+
+---
+
+## 21. 上场前 Checklist
+- [ ] 我能讲清上传-转码-分发-播放全链路。  
+- [ ] 我能解释 ABR 为什么必要。  
+- [ ] 我能说出 3 个 QoE 指标和阈值。  
+- [ ] 我能给出 CDN 命中率下降的处理方案。  
+- [ ] 我能讲清降本与体验之间的取舍。  
+
+---
+
+## 22. 30 秒总结
+- 视频系统核心不是“把文件放到云上”，而是“在不同网络下稳定播放且成本可控”。  
+- 面试要讲清：多码率转码、ABR、CDN、QoE、故障与回滚。  
+- 按“故事 -> 链路 -> 指标 -> 例子 -> 兜底”讲，面试官会觉得你有实战感。  

@@ -1,0 +1,216 @@
+# 母题 Q43：Task Scheduler（任务调度器，新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 调度器是“按时间/依赖触发任务并可靠执行”的系统。  
+2. 难点是：任务不重复执行、失败可重试、依赖有序、故障可恢复。  
+3. 面试高分关键：讲清触发器、DAG 编排、幂等、补偿和观测。  
+
+---
+
+## 1. 故事开场
+- 每天 2:00 跑账单任务，必须先跑 A 再跑 B。  
+- A 失败了，B 不能跑；A 重试成功后 B 才能继续。  
+- 你需要一个“可控、可追踪、可补救”的调度系统。  
+
+---
+
+## 2. 名词白话
+| 术语 | 白话 |
+|---|---|
+| Cron Trigger | 定时触发 |
+| DAG | 任务依赖图 |
+| Executor | 执行器节点 |
+| Retry | 失败重试 |
+| Backoff | 重试间隔递增 |
+| Compensation | 补偿动作 |
+| Idempotent | 重复执行结果一致 |
+| Dead Letter | 多次失败后入死信 |
+
+---
+
+## 3. 需求澄清
+- 支持 cron、延时、事件触发。  
+- 支持任务依赖（DAG）。  
+- 支持失败重试和补偿。  
+- 支持任务状态查询和告警。  
+
+非功能：  
+- 调度准确性（触发漂移可控）。  
+- 高可用 >= 99.95%。  
+
+---
+
+## 4. 容量估算
+- 任务定义 100 万。  
+- 每分钟触发 20 万实例。  
+- 峰值执行 QPS 5000+。  
+
+---
+
+## 5. 架构
+```text
+Scheduler API -> Metadata DB
+              -> Trigger Engine
+              -> Queue (Kafka/Rabbit)
+              -> Dispatcher -> Executors
+              -> State Store
+              -> Retry/Compensation Worker
+```
+
+---
+
+## 6. API 设计
+- `POST /v1/jobs` 创建任务  
+- `POST /v1/jobs/{id}/trigger` 手动触发  
+- `GET /v1/jobs/{id}/runs` 查看实例  
+- `POST /v1/jobs/{id}/pause` 暂停  
+
+---
+
+## 7. 数据模型
+```sql
+CREATE TABLE job_def (
+  job_id BIGINT PRIMARY KEY,
+  name VARCHAR(128) NOT NULL,
+  trigger_type VARCHAR(16) NOT NULL,  -- CRON/EVENT/DELAY
+  trigger_expr VARCHAR(128),
+  retry_policy JSON,
+  timeout_sec INT NOT NULL,
+  enabled BOOLEAN NOT NULL
+);
+```
+
+```sql
+CREATE TABLE job_instance (
+  instance_id BIGINT PRIMARY KEY,
+  job_id BIGINT NOT NULL,
+  state VARCHAR(16) NOT NULL,         -- PENDING/RUNNING/SUCCESS/FAILED
+  attempt INT NOT NULL DEFAULT 0,
+  scheduled_at TIMESTAMP NOT NULL,
+  started_at TIMESTAMP,
+  ended_at TIMESTAMP
+);
+```
+
+---
+
+## 8. 核心流程
+1. Trigger Engine 生成待执行实例。  
+2. Dispatcher 分发到 Executor。  
+3. 执行成功写 SUCCESS。  
+4. 失败按策略重试。  
+5. 超过上限进 dead letter。  
+
+---
+
+## 9. 幂等与一致性
+- `job_id + schedule_time` 作为逻辑唯一键防重复触发。  
+- 执行器要幂等，防止网络抖动重复执行。  
+- 依赖任务完成后再触发下游。  
+
+---
+
+## 10. 可用性与容错
+- Trigger Engine 主备选举。  
+- Queue 持久化防止实例丢失。  
+- 执行器宕机超时回收重派。  
+
+---
+
+## 11. 可观测性
+- `trigger_delay_ms`  
+- `dispatch_latency`  
+- `success_rate`  
+- `retry_count`  
+- `dead_letter_count`  
+
+---
+
+## 12. 成本取舍
+- 高精度调度成本更高。  
+- 重试过多会放大下游压力。  
+- DAG 越复杂越难排障。  
+
+---
+
+## 13. Java 关键代码（4 段）
+```java
+public class CronTriggerEngine {
+  public List<JobInstance> pollDueJobs(Instant now) {
+    return jobRepo.findEnabledCronJobs().stream()
+      .filter(j -> cronMatcher.isDue(j.triggerExpr(), now))
+      .map(j -> JobInstance.create(j.jobId(), now))
+      .toList();
+  }
+}
+```
+
+```java
+public class Dispatcher {
+  public void dispatch(JobInstance ins) {
+    ExecutorNode node = loadBalancer.pick(ins.jobId());
+    queue.send(node.topic(), ins);
+  }
+}
+```
+
+```java
+public class RetryPolicy {
+  public Duration nextDelay(int attempt) {
+    long ms = Math.min(60000, (long) (Math.pow(2, attempt) * 1000));
+    return Duration.ofMillis(ms);
+  }
+}
+```
+
+```java
+public class CompensationWorker {
+  public void handleFailed(JobInstance ins) {
+    if (ins.attempt() >= 3) {
+      deadLetterRepo.save(ins);
+      return;
+    }
+    scheduler.reschedule(ins, retryPolicy.nextDelay(ins.attempt()));
+  }
+}
+```
+
+---
+
+## 14. 测试策略
+- 单测：cron 解析、状态机迁移。  
+- 压测：高峰触发与分发。  
+- 故障注入：执行器宕机、队列延迟。  
+
+---
+
+## 15. 10 个例子
+1. 每日账单任务。  
+2. 任务 A 成功后触发 B。  
+3. 任务失败指数退避重试。  
+4. 任务超时中断。  
+5. 执行器挂掉自动重派。  
+6. 死信任务人工重跑。  
+7. 节假日暂停任务。  
+8. 批量补跑历史日期。  
+9. 某租户任务限流隔离。  
+10. 发布新版本调度器灰度。  
+
+---
+
+## 16. 面试追问
+- 如何避免任务重复执行？  
+- DAG 循环依赖怎么处理？  
+- 重试风暴怎么治理？  
+
+---
+
+## 17. 新手路线 + Checklist
+- 先做 cron + queue，再做依赖和补偿。  
+- Checklist：触发、执行、重试、幂等、观测都能讲。  
+
+---
+
+## 18. 30 秒总结
+- 调度系统核心是“准时触发、可靠执行、失败可恢复”。  
+- 面试讲清状态机、幂等、重试补偿和可观测性就很稳。  

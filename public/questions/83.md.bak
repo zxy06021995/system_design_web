@@ -1,0 +1,235 @@
+# 母题 Q83：E-commerce Website（新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. 电商系统核心链路：浏览 -> 下单 -> 扣库存 -> 支付 -> 履约。  
+2. 难点是高并发下防超卖、防重复下单、防状态错乱。  
+3. 面试高分关键：讲清订单状态机、库存预占、异步补偿和大促限流。  
+
+---
+
+## 1. 故事开场
+- 大促 0 点，某商品 1 万库存，10 万人同时点击购买。  
+- 如果没有正确的库存机制，就会超卖。  
+- 系统要做到：快、准、稳。  
+
+---
+
+## 2. 白话术语
+| 术语 | 白话 |
+|---|---|
+| Cart | 购物车 |
+| Checkout | 结算 |
+| Reservation | 库存预占 |
+| Order State Machine | 订单状态机 |
+| Saga | 跨服务补偿事务 |
+| Fulfillment | 履约发货 |
+| Idempotency | 幂等防重复 |
+
+---
+
+## 3. 需求澄清
+- 商品浏览、下单、支付、发货、售后。  
+- 秒杀和日常购买并存。  
+- 支持退款、取消。  
+
+非功能：  
+- 下单链路 P95 < 300ms（不含支付网关）。  
+- 大促峰值可用性 >= 99.95%。  
+
+---
+
+## 4. 容量估算
+- 峰值下单 200k QPS。  
+- 库存扣减必须在毫秒级完成。  
+- 订单写入和状态流转吞吐巨大，需分库分表。  
+
+---
+
+## 5. 架构
+```text
+Gateway
+ -> Catalog Service
+ -> Cart Service
+ -> Order Service
+ -> Inventory Service
+ -> Payment Service
+ -> Fulfillment Service
+ -> Notification Service
+ -> MQ + Outbox + Observability
+```
+
+---
+
+## 6. API 设计
+- `POST /v1/orders/preview`  
+- `POST /v1/orders`  
+- `POST /v1/orders/{id}/pay`  
+- `POST /v1/orders/{id}/cancel`  
+- `GET /v1/orders/{id}`  
+
+---
+
+## 7. 数据模型
+```sql
+CREATE TABLE orders (
+  order_id BIGINT PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  status VARCHAR(32) NOT NULL, -- CREATED/RESERVED/PAID/CANCELED/SHIPPED/REFUNDED
+  total_amount BIGINT NOT NULL,
+  created_at TIMESTAMP NOT NULL
+);
+```
+
+```sql
+CREATE TABLE order_item (
+  order_id BIGINT NOT NULL,
+  sku_id BIGINT NOT NULL,
+  qty INT NOT NULL,
+  price BIGINT NOT NULL,
+  PRIMARY KEY (order_id, sku_id)
+);
+```
+
+```sql
+CREATE TABLE inventory_reservation (
+  reserve_id BIGINT PRIMARY KEY,
+  order_id BIGINT NOT NULL,
+  sku_id BIGINT NOT NULL,
+  qty INT NOT NULL,
+  state VARCHAR(16) NOT NULL, -- HOLD/CONFIRMED/RELEASED
+  expire_at TIMESTAMP NOT NULL
+);
+```
+
+---
+
+## 8. 核心流程
+1. 下单校验价格和库存。  
+2. 预占库存（有过期时间）。  
+3. 创建订单待支付。  
+4. 支付成功后确认库存并进入履约。  
+5. 支付超时释放库存。  
+
+---
+
+## 9. 一致性与补偿
+- 单服务本地事务。  
+- 跨服务用 Saga + Outbox。  
+- 支付失败/超时触发库存释放补偿。  
+
+---
+
+## 10. 可用性与容错
+- 大促入口限流 + 队列削峰。  
+- 库存服务热点隔离。  
+- 核心链路熔断降级（先下单后补详情）。  
+
+---
+
+## 11. 可观测性
+- `order_create_qps`  
+- `reserve_success_rate`  
+- `pay_success_rate`  
+- `oversell_count`  
+- `compensation_lag`  
+
+---
+
+## 12. 安全与风控
+- 下单防刷（设备/IP/账号画像）。  
+- 支付前风控校验。  
+- 审计异常退款。  
+
+---
+
+## 13. 成本取舍
+- 强一致库存昂贵，需在热点商品做优化。  
+- 预占库存过长会降低转化，过短会影响用户体验。  
+
+---
+
+## 14. Java 关键代码（4 段）
+```java
+public class OrderService {
+  public long createOrder(CreateOrderCmd cmd) {
+    String idem = cmd.userId() + ":" + cmd.clientReqId();
+    if (!idemRepo.tryAcquire(idem)) return idemRepo.replayOrderId(idem);
+    long orderId = idGen.nextId();
+    orderRepo.insert(orderId, cmd.userId(), "CREATED", cmd.totalAmount());
+    outboxRepo.insert("ORDER_CREATED", orderId);
+    return orderId;
+  }
+}
+```
+
+```java
+public class InventoryService {
+  public boolean reserve(long orderId, long skuId, int qty) {
+    int updated = stockRepo.reserveIfEnough(skuId, qty);
+    if (updated == 1) {
+      reserveRepo.insert(orderId, skuId, qty, "HOLD");
+      return true;
+    }
+    return false;
+  }
+}
+```
+
+```java
+public class PaymentCallbackHandler {
+  public void onPaySuccess(long orderId) {
+    orderRepo.updateStatus(orderId, "PAID");
+    reserveRepo.confirmByOrder(orderId);
+    outboxRepo.insert("ORDER_PAID", orderId);
+  }
+}
+```
+
+```java
+public class CompensationWorker {
+  public void onPayTimeout(long orderId) {
+    orderRepo.updateStatus(orderId, "CANCELED");
+    reserveRepo.releaseByOrder(orderId);
+  }
+}
+```
+
+---
+
+## 15. 测试策略
+- 并发下单防超卖测试。  
+- 支付回调重复通知幂等测试。  
+- 失败补偿链路演练。  
+
+---
+
+## 16. 10 个例子
+1. 秒杀 10 万人抢 1 万库存。  
+2. 支付超时自动取消。  
+3. 支付回调重复到达。  
+4. 库存服务短时不可用。  
+5. 订单状态回滚。  
+6. 多仓发货拆单。  
+7. 用户取消后库存释放。  
+8. 风控拦截高风险订单。  
+9. 退款后库存是否回补。  
+10. 大促期间入口限流。  
+
+---
+
+## 17. 面试追问
+- 如何防止超卖？  
+- 订单和库存如何保证一致？  
+- 秒杀怎么抗峰值？  
+
+---
+
+## 18. 新手路线 + Checklist
+- 先做订单+库存，再做支付和补偿。  
+- Checklist：状态机、预占、补偿、幂等、监控。  
+
+---
+
+## 19. 30 秒总结
+- 电商系统核心是“订单状态机 + 库存一致性 + 高峰治理”。  
+- 面试把超卖防护、补偿链路、可观测性讲清基本稳。  

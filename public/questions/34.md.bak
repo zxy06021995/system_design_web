@@ -1,0 +1,246 @@
+# 母题 Q34：Design Redis（新手能懂 + 面试能讲清）
+
+## 0. 三句话讲明白
+1. Redis 不是“一个快缓存”，而是“多数据结构 + 高性能内存数据库”。  
+2. 难点在于：持久化、主从复制、故障切换、集群扩容。  
+3. 面试高分关键：讲清数据结构、RDB/AOF 取舍、Sentinel/Cluster、高可用与一致性边界。  
+
+---
+
+## 1. 小故事开场
+- 电商秒杀时数据库扛不住，先把热点库存和会话放 Redis。  
+- 结果：QPS 上来后，Redis 也可能出热点、OOM、主从延迟。  
+- 所以这题核心是“性能 + 可用 + 持久化”的平衡。  
+
+---
+
+## 2. 名词白话表
+| 术语 | 白话解释 | 面试可复述 |
+|---|---|---|
+| String | 键值对 | “最常用，存计数、token” |
+| Hash | 小对象 | “用户配置这类字段集合” |
+| List | 队列 | “消息队列、任务队列” |
+| Set | 去重集合 | “标签、好友关系去重” |
+| ZSet | 带分数集合 | “排行榜” |
+| RDB | 快照持久化 | “定时拍内存照片” |
+| AOF | 日志持久化 | “把写命令记日志” |
+| Sentinel | 哨兵 | “监控主从并自动切主” |
+| Cluster | 分片集群 | “多节点分担数据和流量” |
+| Eviction | 淘汰策略 | “内存满了删谁” |
+
+---
+
+## 3. 需求澄清
+- 支持高并发读写。  
+- 支持多数据结构。  
+- 支持故障恢复与数据持久化。  
+- 支持水平扩容。  
+
+非功能：  
+- 单机低延迟（毫秒级甚至亚毫秒）。  
+- 高可用 >= 99.95%。  
+
+不做：  
+- 不做完整关系型事务能力。  
+- 不做复杂 SQL 查询。  
+
+---
+
+## 4. 容量估算
+- 假设峰值 500k ops/s。  
+- 平均 value 500B，1 亿 key -> 约 50GB 原始数据（不含对象开销）。  
+- Redis 对象与哈希表有额外开销，内存预算要放大 1.5~2 倍。  
+
+---
+
+## 5. 架构
+```text
+Client
+  -> Proxy/Client Cluster Mode
+    -> Redis Cluster (multi shards)
+      -> Master + Replica
+  -> Sentinel (for failover in non-cluster setup)
+  -> Persistence (RDB/AOF)
+```
+
+---
+
+## 6. 数据结构与适用场景
+- String：计数器、分布式锁 token。  
+- Hash：用户 profile、商品属性。  
+- List：任务队列。  
+- Set：去重用户集合。  
+- ZSet：排行榜、延迟队列。  
+
+---
+
+## 7. API / 命令设计（典型）
+- String：`SET key value EX 60 NX`  
+- Counter：`INCRBY`  
+- Hash：`HSET/HGETALL`  
+- List：`LPUSH/RPOP`  
+- ZSet：`ZADD/ZREVRANGE`  
+
+---
+
+## 8. 持久化策略（重点）
+### 8.1 RDB
+- 优点：恢复快、文件紧凑。  
+- 缺点：两次快照间可能丢数据。  
+
+### 8.2 AOF
+- 优点：数据更完整。  
+- 缺点：文件大、重写成本高。  
+
+### 8.3 混合策略
+- 常见：RDB + AOF 同时开。  
+- 面试可说：性能优先时偏 RDB，数据安全优先时偏 AOF everysec。  
+
+---
+
+## 9. 复制与高可用
+- 主从复制：主写从读。  
+- Sentinel：监控主节点，故障时提升从为主。  
+- Cluster：16384 槽位分片，支持水平扩展。  
+
+一致性边界：  
+- 主从复制默认异步，存在短时延迟。  
+- 强一致不是 Redis 目标。  
+
+---
+
+## 10. 热点与大 Key 问题
+- 热点 key：单 key QPS 超高导致单核瓶颈。  
+  - 方案：本地缓存、多级缓存、热点拆分。  
+- 大 key：操作慢、阻塞事件循环。  
+  - 方案：拆 key、扫描替代全量命令。  
+
+---
+
+## 11. 可用性与容错
+- 防止 OOM：合理 `maxmemory` + 淘汰策略。  
+- 防止阻塞：禁用 `KEYS *`、大集合慢操作。  
+- 故障恢复：哨兵自动切主 + 客户端重连。  
+
+---
+
+## 12. 可观测性
+- `ops_per_sec`  
+- `used_memory` / `mem_fragmentation_ratio`  
+- `hit_rate`  
+- `aof_rewrite_in_progress`  
+- `replication_lag`  
+- `evicted_keys`  
+
+告警示例：  
+- `replication_lag > 3s` 持续 5 分钟。  
+- `mem_fragmentation_ratio > 1.8`。  
+
+---
+
+## 13. 安全
+- ACL 用户与命令权限控制。  
+- 内网部署 + TLS（有条件）。  
+- 禁用高危命令（如 FLUSHALL 在生产）。  
+
+---
+
+## 14. 成本取舍
+- 全内存快但贵，冷热分层可降本。  
+- AOF 更安全但 CPU/IO 成本更高。  
+- 读写分离提高吞吐，但一致性读要回主。  
+
+---
+
+## 15. Java 关键代码（4 段）
+```java
+public class CacheAsideService {
+  public String get(String key) {
+    String val = redis.get(key);
+    if (val != null) return val;
+    String db = dbRepo.query(key);
+    if (db != null) redis.setex(key, 60, db);
+    return db;
+  }
+}
+```
+
+```java
+public class TokenBucketLimiter {
+  public boolean allow(String key, int refillPerSec, int capacity) {
+    // 简化示意，生产常用 Lua 保证原子性
+    long now = System.currentTimeMillis();
+    Bucket b = bucketRepo.load(key);
+    b.refill(now, refillPerSec, capacity);
+    if (b.tokens() <= 0) return false;
+    b.consume(1);
+    bucketRepo.save(key, b);
+    return true;
+  }
+}
+```
+
+```java
+public class DistributedLock {
+  public boolean tryLock(String key, String token, int ttlSec) {
+    return "OK".equals(redis.set(key, token, "NX", "EX", ttlSec));
+  }
+
+  public void unlock(String key, String token) {
+    String lua = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+    redis.eval(lua, List.of(key), List.of(token));
+  }
+}
+```
+
+```java
+public class DelayQueueByZSet {
+  public void enqueue(String taskId, long executeAtMs) {
+    redis.zadd("dq:tasks", executeAtMs, taskId);
+  }
+
+  public List<String> poll(long nowMs, int limit) {
+    return redis.zrangeByScore("dq:tasks", 0, nowMs, 0, limit);
+  }
+}
+```
+
+---
+
+## 16. 测试策略
+- 压测：读写混合、热点 key、故障切换。  
+- 故障注入：主节点宕机、AOF rewrite 压力。  
+- 回归：持久化恢复一致性验证。  
+
+---
+
+## 17. 10 个例子
+1. 登录 token 存 String。  
+2. 排行榜用 ZSet。  
+3. 秒杀库存计数器。  
+4. 分布式锁防重复下单。  
+5. 大 key 导致慢查询。  
+6. 热 key 打爆单分片。  
+7. AOF 过大触发重写。  
+8. 主从切换瞬时抖动。  
+9. 缓存穿透用布隆过滤器。  
+10. 缓存雪崩用随机过期。  
+
+---
+
+## 18. 面试追问
+- Redis 为什么快？  
+- RDB 与 AOF 怎么选？  
+- Cluster 扩容如何做？  
+
+---
+
+## 19. 新手路线 + Checklist
+- 先掌握五大数据结构，再掌握持久化和高可用。  
+- Checklist：数据结构、持久化、复制、容错、监控都能讲。  
+
+---
+
+## 20. 30 秒总结
+- Redis 设计题核心是“性能、可靠性、扩展性”三者平衡。  
+- 把数据结构+持久化+高可用+热点治理讲清就很有竞争力。  
