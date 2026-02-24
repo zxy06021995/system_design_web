@@ -1,73 +1,90 @@
-# React + TypeScript + Vite
+# System Design Web
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+一个系统设计题库学习网站，前端基于 `React + TypeScript + Vite`，支持：
 
-Currently, two official plugins are available:
+- 题目列表浏览与筛选
+- 单题 Markdown 内容渲染
+- 母题与非母题学习映射（由题库元数据驱动）
+- 本地开发、构建与部署
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## 技术栈
 
-## React Compiler
+- React 19
+- TypeScript
+- Vite
+- Tailwind CSS
+- Radix UI
+- React Router
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## 本地开发
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+默认开发地址通常为：
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+- `http://localhost:5173`
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## 构建与预览
+
+```bash
+npm run build
+npm run preview
 ```
+
+## 目录结构
+
+```text
+app/
+  public/
+    questions/          # 题目 Markdown 内容（按 id 命名，如 25.md）
+  src/
+    data/questions.ts   # 题库元数据（标题、分类、母题映射等）
+    pages/              # 页面组件
+    components/         # 通用与业务组件
+```
+
+## 题目数据来源与加载规则
+
+- 题目元数据：`src/data/questions.ts`
+- 题目正文：`public/questions/{id}.md`
+- 运行时加载函数：`loadQuestionContent(id)`（按 `id` 拉取 markdown）
+
+## 内容维护规范（建议）
+
+1. 新增/修改题目正文时，文件名必须与题目 `id` 一致。  
+2. 先改 `questions.ts` 再补对应 markdown，避免页面出现空内容。  
+3. 提交前建议执行一次：
+
+```bash
+npm run build
+```
+
+## 常见命令
+
+```bash
+# 开发
+npm run dev
+
+# 构建
+npm run build
+
+# 本地预览构建产物
+npm run preview
+
+# 代码检查
+npm run lint
+```
+
+## Git 提交建议
+
+- 提交信息按“范围 + 动作”描述，例如：
+  - `docs: rewrite question 37 note`
+  - `feat: update question taxonomy mapping`
+  - `fix: correct markdown loading path`
+
+## License
+
+仅用于学习与个人项目实践，商业使用请自行评估内容版权与合规要求。
