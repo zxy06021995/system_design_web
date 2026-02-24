@@ -1,0 +1,29 @@
+[
+  {
+    "id": "harness-setup",
+    "title": "Long-running agent harness setup",
+    "target_file": "agent/*",
+    "scope": "Create session artifacts and operating checklist",
+    "acceptance": "All harness files exist and are usable",
+    "status": "done",
+    "last_update": "2026-02-24"
+  },
+  {
+    "id": "playwright-smoke-setup",
+    "title": "Playwright smoke setup in app",
+    "target_file": "tests/smoke.spec.ts",
+    "scope": "Install playwright and wire smoke scripts",
+    "acceptance": "build + smoke runnable",
+    "status": "done",
+    "last_update": "2026-02-24"
+  },
+  {
+    "id": "non-core-q38plus",
+    "title": "Rewrite non-core questions from 38+ one by one",
+    "target_file": "public/questions/{id}.md",
+    "scope": "Single-question 22-section rewrite with gates",
+    "acceptance": "Each question passes >=95 self-review and smoke gates",
+    "status": "todo",
+    "last_update": "2026-02-24"
+  }
+]
