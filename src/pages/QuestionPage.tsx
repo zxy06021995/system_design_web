@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { useParams, Link, Navigate, useLocation } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Prism from 'prismjs';
@@ -15,8 +15,7 @@ import 'prismjs/components/prism-javascript';
 import 'prismjs/components/prism-http';
 import 'prismjs/themes/prism-tomorrow.css';
 
-import { questions } from '../data/questions';
-import { loadQuestionContent } from '../data/questions';
+import { questions, loadQuestionContent, questionAliases } from '../data/questions';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 
@@ -64,11 +63,29 @@ const difficultyConfig = {
 
 export function QuestionPage() {
   const { id } = useParams<{ id: string }>();
+  const location = useLocation();
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const contentRef = useRef<HTMLDivElement>(null);
 
-  const question = questions.find(q => q.id === parseInt(id || '0'));
+  const requestedId = Number.parseInt(id || '0', 10);
+  const canonicalId = questionAliases[requestedId] ?? requestedId;
+  const redirectId = questionAliases[requestedId];
+  const mergedFrom =
+    location.state &&
+    typeof location.state === 'object' &&
+    'mergedFrom' in location.state &&
+    typeof location.state.mergedFrom === 'number'
+      ? location.state.mergedFrom
+      : null;
+  const question = questions.find((q) => q.id === canonicalId);
+  const orderedQuestionIds = useMemo(() => questions.map((q) => q.id).sort((a, b) => a - b), []);
+  const currentQuestionIndex = question ? orderedQuestionIds.indexOf(question.id) : -1;
+  const prevQuestionId = currentQuestionIndex > 0 ? orderedQuestionIds[currentQuestionIndex - 1] : null;
+  const nextQuestionId =
+    currentQuestionIndex >= 0 && currentQuestionIndex < orderedQuestionIds.length - 1
+      ? orderedQuestionIds[currentQuestionIndex + 1]
+      : null;
 
   useEffect(() => {
     if (question) {
@@ -91,6 +108,10 @@ export function QuestionPage() {
       Prism.highlightAllUnder(contentRef.current);
     }
   }, [content]);
+
+  if (redirectId) {
+    return <Navigate to={`/question/${redirectId}`} replace state={{ mergedFrom: requestedId }} />;
+  }
 
   if (!question) {
     return (
@@ -137,6 +158,13 @@ export function QuestionPage() {
         <div className="container mx-auto px-4 py-8 max-w-7xl">
           <div className="flex items-start justify-between gap-4">
             <div className="flex-1">
+              {mergedFrom && (
+                <div className="mb-4">
+                  <Badge variant="outline" className="bg-amber-500/10 text-amber-700 border-amber-500/30">
+                    题号 #{mergedFrom} 已并入当前题
+                  </Badge>
+                </div>
+              )}
               <div className="flex items-center gap-2 mb-4">
                 <Badge variant="outline" className={`${config.color}`}>
                   <span className="flex items-center gap-1">
@@ -296,18 +324,32 @@ export function QuestionPage() {
               <div className="p-4 bg-muted/50 rounded-lg border">
                 <h4 className="font-semibold mb-3">题目导航</h4>
                 <div className="space-y-1">
-                  <Link to={`/question/${Math.max(1, question.id - 1)}`}>
-                    <Button variant="ghost" size="sm" className="w-full justify-start" disabled={question.id <= 1}>
+                  {prevQuestionId ? (
+                    <Link to={`/question/${prevQuestionId}`}>
+                      <Button variant="ghost" size="sm" className="w-full justify-start">
+                        <ChevronLeft className="w-4 h-4 mr-2" />
+                        上一题
+                      </Button>
+                    </Link>
+                  ) : (
+                    <Button variant="ghost" size="sm" className="w-full justify-start" disabled>
                       <ChevronLeft className="w-4 h-4 mr-2" />
                       上一题
                     </Button>
-                  </Link>
-                  <Link to={`/question/${Math.min(questions.length, question.id + 1)}`}>
-                    <Button variant="ghost" size="sm" className="w-full justify-start" disabled={question.id >= questions.length}>
+                  )}
+                  {nextQuestionId ? (
+                    <Link to={`/question/${nextQuestionId}`}>
+                      <Button variant="ghost" size="sm" className="w-full justify-start">
+                        下一题
+                        <ChevronLeft className="w-4 h-4 ml-2 rotate-180" />
+                      </Button>
+                    </Link>
+                  ) : (
+                    <Button variant="ghost" size="sm" className="w-full justify-start" disabled>
                       下一题
                       <ChevronLeft className="w-4 h-4 ml-2 rotate-180" />
                     </Button>
-                  </Link>
+                  )}
                 </div>
               </div>
 
