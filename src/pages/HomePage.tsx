@@ -7,7 +7,7 @@ import { Input } from '../components/ui/input';
 import { Button } from '../components/ui/button';
 import { Badge } from '../components/ui/badge';
 import { Tabs, TabsList, TabsTrigger } from '../components/ui/tabs';
-import { Search, Filter, X, BookOpen, Star, TrendingUp, Zap, FolderOpen, ChevronDown, ChevronRight } from 'lucide-react';
+import { Search, Filter, X, BookOpen, Star, TrendingUp, Zap, FolderOpen, ChevronDown, ChevronRight, Layers3, ArrowRight } from 'lucide-react';
 
 type FilterType = 'all' | Difficulty;
 type FineCategory = (typeof categories)[number];
@@ -249,6 +249,31 @@ export function HomePage() {
       </div>
 
       <StatsPanel stats={stats} />
+
+      <section className="mb-8 rounded-lg border bg-gradient-to-r from-blue-500/5 via-cyan-500/5 to-emerald-500/5 p-5">
+        <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div className="max-w-3xl">
+            <div className="flex items-center gap-2 mb-2">
+              <Badge variant="outline" className="bg-blue-500/10 text-blue-600 border-blue-500/20">
+                <Layers3 className="w-3 h-3 mr-1" />
+                基础知识
+              </Badge>
+              <Badge variant="secondary">系统设计 + Java 开发复习</Badge>
+            </div>
+            <h2 className="text-xl font-semibold mb-2">独立基础知识页</h2>
+            <p className="text-sm text-muted-foreground">
+              单独整理分片、分库分表、热点、Redis slot、MongoDB、Cassandra 和 Java 路由示例，
+              用于面试前快速复习，不混进题库题号体系。
+            </p>
+          </div>
+          <Link to="/basics/sharding" className="no-underline">
+            <Button className="gap-2">
+              打开分片复习页
+              <ArrowRight className="w-4 h-4" />
+            </Button>
+          </Link>
+        </div>
+      </section>
 
       <section className="mb-8 rounded-lg border bg-muted/20 p-4">
         <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">

@@ -1020,6 +1020,16 @@ const rawQuestions: Question[] = [
     tags: ['RAG', '向量检索', '权限过滤', '文档解析', '引用回答'],
     summary: '设计企业知识文档 GPT，支持上传企业文档、权限过滤检索、带引用问答和文档更新。',
     keyPoints: ['混合检索', '双重权限校验', '文档解析与切分', '索引更新与缓存失效', '答案引用与防幻觉']
+  },
+  {
+    id: 105,
+    title: 'Design Order Processing Pipeline with Message Queue（基于消息队列的订单异步流水线）',
+    titleEn: 'Order Processing Pipeline with Message Queue',
+    difficulty: '高频',
+    category: '分布式系统',
+    tags: ['Message Queue', 'Pipeline', 'Saga', 'Idempotency', 'Final Consistency', 'Order Processing'],
+    summary: '设计一个基于消息队列的订单异步流水线系统，处理订单主链路与辅助任务，保证幂等、可恢复和最终一致性。',
+    keyPoints: ['主链路与辅助任务拆分', 'Pipeline 顺序推进', '幂等与 request_id', 'Worker crash 恢复', '局部顺序与热点分区']
   }
 ];
 
@@ -1217,7 +1227,8 @@ const fineCategoryById: Record<number, FineCategory> = {
   100: '负载均衡',
   101: '分类信息与市场平台',
   102: '本地配送与履约',
-  104: '企业知识检索 / RAG'
+  104: '企业知识检索 / RAG',
+  105: '消息队列'
 };
 
 const domainByFineCategory: Record<FineCategory, TaxonomyCategory> = {

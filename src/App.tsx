@@ -1,6 +1,7 @@
 import { Routes, Route } from 'react-router-dom';
 import { HomePage } from './pages/HomePage';
 import { QuestionPage } from './pages/QuestionPage';
+import { BasicsPage } from './pages/BasicsPage';
 import { Header } from './components/Header';
 import { Footer } from './components/Footer';
 import './App.css';
@@ -13,6 +14,7 @@ function App() {
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/question/:id" element={<QuestionPage />} />
+          <Route path="/basics/:slug" element={<BasicsPage />} />
         </Routes>
       </main>
       <Footer />
